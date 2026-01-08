@@ -8,9 +8,12 @@ from datetime import datetime
 import base64
 import tempfile
 import os
+import asyncio
+import socket
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+import urllib3
 
 from src.database import get_db
 from src.models.cluster import Cluster
@@ -175,6 +178,21 @@ async def delete_cluster(cluster_id: str, db: AsyncSession = Depends(get_db)):
     return {"message": "Cluster deleted successfully"}
 
 
+def _check_cluster_sync(kubeconfig_path: str):
+    """Synchronous cluster check - runs in thread to enable timeout."""
+    config.load_kube_config(config_file=kubeconfig_path)
+    
+    # Configure API client with connection timeout
+    configuration = client.Configuration.get_default_copy()
+    configuration.connection_pool_maxsize = 1
+    api_client = client.ApiClient(configuration)
+    
+    # Try to get cluster version - simple health check
+    version_api = client.VersionApi(api_client)
+    version = version_api.get_code()
+    return version
+
+
 @router.post("/{cluster_id}/check-status")
 async def check_cluster_status(cluster_id: str, db: AsyncSession = Depends(get_db)):
     """Check if cluster is up or down by connecting to Kubernetes API."""
@@ -196,34 +214,44 @@ async def check_cluster_status(cluster_id: str, db: AsyncSession = Depends(get_d
             temp_kubeconfig_path = temp_file.name
         
         try:
-            # Load kubeconfig and create API client
-            config.load_kube_config(config_file=temp_kubeconfig_path)
-            v1 = client.CoreV1Api()
+            # Set default socket timeout to prevent hanging
+            socket.setdefaulttimeout(5)
             
-            # Try to get cluster version - simple health check
-            version = client.VersionApi().get_code()
-            
-            # If we get here, cluster is up
-            cluster.status = "up"
-            cluster.last_checked = datetime.utcnow()
-        except ApiException as e:
-            # Kubernetes API error - cluster is down or unreachable
-            cluster.status = "down"
-            cluster.last_checked = datetime.utcnow()
-        except Exception as e:
-            # Any other error - cluster is down
-            cluster.status = "down"
-            cluster.last_checked = datetime.utcnow()
+            # Wrap the blocking k8s call in asyncio timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_check_cluster_sync, temp_kubeconfig_path),
+                    timeout=10.0  # 10 second overall timeout
+                )
+                cluster.status = "up"
+                cluster.last_checked = datetime.utcnow()
+                print(f"Cluster {cluster.name} is up")
+            except asyncio.TimeoutError:
+                cluster.status = "down"
+                cluster.last_checked = datetime.utcnow()
+                print(f"Cluster {cluster.name} timed out - marking as down")
+            except Exception as e:
+                cluster.status = "down"
+                cluster.last_checked = datetime.utcnow()
+                print(f"Cluster {cluster.name} error: {str(e)}")
+            finally:
+                # Reset socket timeout
+                socket.setdefaulttimeout(None)
         finally:
             # Clean up temporary file
             if os.path.exists(temp_kubeconfig_path):
                 os.unlink(temp_kubeconfig_path)
     except Exception as e:
         # Failed to decrypt or process kubeconfig
-        cluster.status = "unknown"
+        cluster.status = "error"
         cluster.last_checked = datetime.utcnow()
-        raise HTTPException(status_code=500, detail=f"Failed to check cluster status: {str(e)}")
+        print(f"Failed to process kubeconfig for cluster {cluster.name}: {str(e)}")
     
-    await db.commit()
+    # Always commit the status update
+    try:
+        await db.commit()
+    except Exception as e:
+        print(f"Failed to commit cluster status: {str(e)}")
+        await db.rollback()
     
     return {"status": cluster.status, "last_checked": cluster.last_checked}

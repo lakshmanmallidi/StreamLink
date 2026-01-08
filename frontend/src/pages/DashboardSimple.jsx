@@ -25,13 +25,30 @@ export default function Dashboard({ children }) {
   useEffect(() => {
     if (location.pathname !== "/") return;
 
-    const interval = setInterval(() => {
-      fetchClusters();
-      fetchServices();
+    const interval = setInterval(async () => {
+      // Check actual cluster status first
+      if (clusters.length > 0) {
+        await checkClusterStatus(clusters[0].id);
+      }
+      // Then fetch updated data
+      await fetchClusters();
+      await fetchServices();
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [location.pathname]);
+  }, [location.pathname, clusters]);
+
+  const checkClusterStatus = async (clusterId) => {
+    try {
+      const token = localStorage.getItem("access_token");
+      await fetch(`http://localhost:3000/v1/clusters/${clusterId}/check-status`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch (err) {
+      console.error("Error checking cluster status:", err);
+    }
+  };
 
   const fetchClusters = async () => {
     try {

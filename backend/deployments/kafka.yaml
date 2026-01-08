@@ -1,12 +1,13 @@
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: kafka
   namespace: streamlink
   labels:
     app: kafka
 spec:
+  serviceName: kafka
   replicas: 1
   selector:
     matchLabels:
@@ -18,37 +19,55 @@ spec:
     spec:
       containers:
       - name: kafka
-        image: confluentinc/cp-kafka:7.5.0
+        image: apache/kafka:3.7.0
+        command:
+        - sh
+        - -c
+        - |
+          # Create config file
+          cat > /tmp/kraft.properties <<EOF
+          node.id=1
+          process.roles=broker,controller
+          controller.quorum.voters=1@localhost:9093
+          listeners=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          advertised.listeners=PLAINTEXT://kafka:9092
+          controller.listener.names=CONTROLLER
+          listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          log.dirs=/var/lib/kafka/data
+          offsets.topic.replication.factor=1
+          transaction.state.log.replication.factor=1
+          transaction.state.log.min.isr=1
+          auto.create.topics.enable=true
+          EOF
+          
+          # Format storage if not already formatted
+          if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+            echo "Formatting Kafka storage..."
+            /opt/kafka/bin/kafka-storage.sh format -t MkU3OEVBNTcwNTJENDM2Qk -c /tmp/kraft.properties
+          fi
+          
+          # Start Kafka
+          echo "Starting Kafka..."
+          exec /opt/kafka/bin/kafka-server-start.sh /tmp/kraft.properties
         ports:
         - containerPort: 9092
           name: plaintext
         - containerPort: 9093
           name: controller
-        env:
-        - name: KAFKA_NODE_ID
-          value: "1"
-        - name: KAFKA_PROCESS_ROLES
-          value: "broker,controller"
-        - name: KAFKA_LISTENERS
-          value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-        - name: KAFKA_ADVERTISED_LISTENERS
-          value: "PLAINTEXT://kafka:9092"
-        - name: KAFKA_CONTROLLER_LISTENER_NAMES
-          value: "CONTROLLER"
-        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-          value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-        - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-          value: "1@localhost:9093"
-        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-          value: "1"
-        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-          value: "1"
-        - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-          value: "1"
-        - name: KAFKA_LOG_DIRS
-          value: "/var/lib/kafka/data"
-        - name: CLUSTER_ID
-          value: "MkU3OEVBNTcwNTJENDM2Qk"
+        livenessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 45
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 10
         resources:
           requests:
             memory: "1Gi"
@@ -59,9 +78,14 @@ spec:
         volumeMounts:
         - name: kafka-data
           mountPath: /var/lib/kafka/data
-      volumes:
-      - name: kafka-data
-        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: kafka-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 3Gi
 ---
 apiVersion: v1
 kind: Service

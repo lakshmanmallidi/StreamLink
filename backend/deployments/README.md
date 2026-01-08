@@ -11,14 +11,24 @@ Each service has its own YAML file containing all necessary Kubernetes resources
 - ConfigMap (if needed)
 - Secret (if needed)
 
-## Available Services
+## Service Dependency Management
 
-### Schema Registry (`schema-registry.yaml`)
-- **Image**: confluentinc/cp-schema-registry:7.5.0
-- **Namespace**: streamlink
-- **Port**: 8081
-- **Resources**: 512Mi-1Gi memory, 250m-500m CPU
-- **Features**: Liveness/Readiness probes configured
+StreamLink automatically handles service dependencies:
+
+**Dependency Graph:**
+- `kafka` → No dependencies
+- `schema-registry` → Depends on `kafka`
+- `kafka-connect` → Depends on `kafka`, `schema-registry`
+- `ksqldb` → Depends on `kafka`
+- `kafka-rest` → Depends on `kafka`, `schema-registry`
+
+When deploying a service, StreamLink will:
+1. Check which dependencies are missing
+2. Show a deployment plan to the user
+3. Install dependencies in the correct order
+4. Finally install the target service
+
+## Available Services
 
 ### Kafka (`kafka.yaml`)
 - **Image**: confluentinc/cp-kafka:7.5.0
@@ -26,24 +36,66 @@ Each service has its own YAML file containing all necessary Kubernetes resources
 - **Port**: 9092 (client), 9093 (controller)
 - **Mode**: KRaft (no Zookeeper required)
 - **Resources**: 1Gi-2Gi memory, 500m-1000m CPU
+- **Dependencies**: None (base service)
+
+### Schema Registry (`schema-registry.yaml`)
+- **Image**: confluentinc/cp-schema-registry:7.5.0
+- **Namespace**: streamlink
+- **Port**: 8081
+- **Resources**: 512Mi-1Gi memory, 250m-500m CPU
+- **Dependencies**: Kafka
+- **Features**: Liveness/Readiness probes configured
 
 ## How It Works
 
 1. **Backend reads YAML**: When deploying a service, the backend reads the corresponding YAML file
-2. **Namespace substitution**: If a custom namespace is specified, it replaces `streamlink` with the custom namespace
-3. **Kubernetes API**: Uses the Python Kubernetes client to apply the manifest
-4. **Resource management**: Handles creation and updates (idempotent)
+2. **Dependency resolution**: Checks for missing dependencies and resolves installation order
+3. **Namespace substitution**: If a custom namespace is specified, it replaces `streamlink` with the custom namespace
+4. **Kubernetes API**: Uses the Python Kubernetes client to apply the manifest
+5. **Resource management**: Handles creation and updates (idempotent)
 
 ## Adding New Services
 
 To add a new service:
 
-1. Create a new YAML file: `<service-name>.yaml`
-2. Include all necessary Kubernetes resources
-3. Use `namespace: streamlink` (will be replaced if needed)
-4. Add resource requests/limits
-5. Configure health checks (liveness/readiness probes)
-6. Update the frontend `Services.jsx` to add the service to the available list
+1. **Create YAML manifest**: `<service-name>.yaml`
+   - Include all necessary Kubernetes resources
+   - Use `namespace: streamlink` (will be replaced if needed)
+   - Add resource requests/limits
+   - Configure health checks (liveness/readiness probes)
+   - Add init containers for dependency checks if needed
+
+2. **Update dependency graph** in `backend/src/utils/dependencies.py`:
+   ```python
+   SERVICE_DEPENDENCIES = {
+       ...
+       "my-service": ["kafka"],  # Add dependencies
+   }
+   
+   SERVICE_DISPLAY_NAMES = {
+       ...
+       "my-service": "My Service",
+   }
+   ```
+
+3. **Update frontend** `frontend/src/pages/Services.jsx`:
+   ```javascript
+   const availableServices = [
+     ...
+     {
+       name: "my-service",
+       displayName: "My Service",
+       description: "Description here. Requires Kafka.",
+       icon: "🎯",
+       dependencies: ["kafka"],
+     },
+   ];
+   ```
+
+4. **Test deployment**:
+   - Start backend and frontend
+   - Try deploying with and without dependencies installed
+   - Verify deployment plan shows correctly
 
 Example structure:
 ```yaml

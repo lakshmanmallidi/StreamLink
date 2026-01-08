@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     # Database Configuration
     # Non-sensitive parts are here, password comes from env var
     DB_HOST: str = "localhost"
-    DB_PORT: int = 5432
+    DB_PORT: int = 5433
     DB_NAME: str = "streamlink"
     DB_USER: str = "streamlink"
     DB_PASSWORD: str = ""  # MUST be set via POSTGRES_PASSWORD env var
