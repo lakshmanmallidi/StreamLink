@@ -1,0 +1,130 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-connect
+  namespace: streamlink
+  labels:
+    app: kafka-connect
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-connect
+  template:
+    metadata:
+      labels:
+        app: kafka-connect
+    spec:
+      initContainers:
+      - name: install-connectors
+        image: confluentinc/cp-kafka-connect:7.5.0
+        command:
+        - sh
+        - -c
+        - |
+          echo "Installing Kafka Connect plugins..."
+          confluent-hub install --no-prompt confluentinc/kafka-connect-datagen:latest
+          echo "Plugin installation complete!"
+        volumeMounts:
+        - name: connect-plugins
+          mountPath: /usr/share/confluent-hub-components
+      containers:
+      - name: kafka-connect
+        image: confluentinc/cp-kafka-connect:7.5.0
+        env:
+        - name: CONNECT_BOOTSTRAP_SERVERS
+          value: "kafka.streamlink.svc.cluster.local:9092"
+        - name: CONNECT_REST_PORT
+          value: "8083"
+        - name: CONNECT_REST_ADVERTISED_HOST_NAME
+          value: "kafka-connect"
+        - name: CONNECT_GROUP_ID
+          value: "streamlink-connect-cluster"
+        - name: CONNECT_CONFIG_STORAGE_TOPIC
+          value: "streamlink-connect-configs"
+        - name: CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR
+          value: "1"
+        - name: CONNECT_OFFSET_STORAGE_TOPIC
+          value: "streamlink-connect-offsets"
+        - name: CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR
+          value: "1"
+        - name: CONNECT_STATUS_STORAGE_TOPIC
+          value: "streamlink-connect-status"
+        - name: CONNECT_STATUS_STORAGE_REPLICATION_FACTOR
+          value: "1"
+        - name: CONNECT_KEY_CONVERTER
+          value: "org.apache.kafka.connect.storage.StringConverter"
+        - name: CONNECT_VALUE_CONVERTER
+          value: "io.confluent.connect.avro.AvroConverter"
+        - name: CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL
+          value: "http://schemaregistry.streamlink.svc.cluster.local:8081"
+        - name: CONNECT_INTERNAL_KEY_CONVERTER
+          value: "org.apache.kafka.connect.json.JsonConverter"
+        - name: CONNECT_INTERNAL_VALUE_CONVERTER
+          value: "org.apache.kafka.connect.json.JsonConverter"
+        - name: CONNECT_PLUGIN_PATH
+          value: "/usr/share/java,/usr/share/confluent-hub-components"
+        - name: CONNECT_LOG4J_ROOT_LOGLEVEL
+          value: "INFO"
+        - name: CONNECT_LOG4J_LOGGERS
+          value: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
+        # Consumer settings
+        - name: CONNECT_CONSUMER_BOOTSTRAP_SERVERS
+          value: "kafka.streamlink.svc.cluster.local:9092"
+        - name: CONNECT_CONSUMER_INTERCEPTOR_CLASSES
+          value: "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
+        # Producer settings
+        - name: CONNECT_PRODUCER_BOOTSTRAP_SERVERS
+          value: "kafka.streamlink.svc.cluster.local:9092"
+        - name: CONNECT_PRODUCER_INTERCEPTOR_CLASSES
+          value: "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
+        ports:
+        - containerPort: 8083
+          name: http
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8083
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8083
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 10
+        volumeMounts:
+        - name: connect-plugins
+          mountPath: /usr/share/confluent-hub-components
+      volumes:
+      - name: connect-plugins
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-connect
+  namespace: streamlink
+  labels:
+    app: kafka-connect
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8083
+    targetPort: 8083
+    protocol: TCP
+    name: http
+  selector:
+    app: kafka-connect

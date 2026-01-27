@@ -1,0 +1,124 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ksqldb-server
+  namespace: streamlink
+  labels:
+    app: ksqldb-server
+spec:
+  serviceName: ksqldb-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ksqldb-server
+  template:
+    metadata:
+      labels:
+        app: ksqldb-server
+    spec:
+      containers:
+      - name: ksqldb-server
+        image: confluentinc/cp-ksqldb-server:7.5.0
+        env:
+        - name: KSQL_BOOTSTRAP_SERVERS
+          value: "kafka.streamlink.svc.cluster.local:9092"
+        - name: KSQL_LISTENERS
+          value: "http://0.0.0.0:8088"
+        - name: KSQL_KSQL_SERVICE_ID
+          value: "streamlink-ksqldb"
+        - name: KSQL_KSQL_SCHEMA_REGISTRY_URL
+          value: "http://schemaregistry.streamlink.svc.cluster.local:8081"
+        - name: KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE
+          value: "true"
+        - name: KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE
+          value: "true"
+        - name: KSQL_CACHE_MAX_BYTES_BUFFERING
+          value: "0"
+        - name: KSQL_KSQL_HIDDEN_TOPICS
+          value: "^_.*,^default_.*"
+        - name: KSQL_PRODUCER_INTERCEPTOR_CLASSES
+          value: "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
+        - name: KSQL_CONSUMER_INTERCEPTOR_CLASSES
+          value: "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
+        - name: KSQL_KSQL_STREAMS_REPLICATION_FACTOR
+          value: "1"
+        - name: KSQL_KSQL_INTERNAL_TOPIC_REPLICAS
+          value: "1"
+        - name: KSQL_KSQL_SINK_REPLICAS
+          value: "1"
+        # Connect ksqlDB to standalone Kafka Connect cluster
+        - name: KSQL_KSQL_CONNECT_URL
+          value: "http://kafka-connect.streamlink.svc.cluster.local:8083"
+        ports:
+        - containerPort: 8088
+          name: http
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /info
+            port: 8088
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /info
+            port: 8088
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 10
+        volumeMounts:
+        - name: ksqldb-queries
+          mountPath: /etc/ksqldb
+        - name: ksqldb-data
+          mountPath: /var/lib/kafka-streams
+      volumes:
+      - name: ksqldb-queries
+        configMap:
+          name: ksqldb-queries
+          optional: true
+  volumeClaimTemplates:
+  - metadata:
+      name: ksqldb-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ksqldb-server
+  namespace: streamlink
+  labels:
+    app: ksqldb-server
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8088
+    targetPort: 8088
+    protocol: TCP
+    name: http
+  selector:
+    app: ksqldb-server
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ksqldb-queries
+  namespace: streamlink
+data:
+  queries.sql: |
+    -- ksqlDB initialization queries can be added here
+    -- Example:
+    -- CREATE STREAM my_stream (id VARCHAR, value VARCHAR) WITH (kafka_topic='my-topic', value_format='json');

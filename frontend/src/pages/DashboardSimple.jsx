@@ -21,23 +21,6 @@ export default function Dashboard({ children }) {
     }
   }, []);
 
-  // Auto-refresh cluster and services status every 5 seconds on dashboard home
-  useEffect(() => {
-    if (location.pathname !== "/") return;
-
-    const interval = setInterval(async () => {
-      // Check actual cluster status first
-      if (clusters.length > 0) {
-        await checkClusterStatus(clusters[0].id);
-      }
-      // Then fetch updated data
-      await fetchClusters();
-      await fetchServices();
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [location.pathname, clusters]);
-
   const checkClusterStatus = async (clusterId) => {
     try {
       const token = localStorage.getItem("access_token");

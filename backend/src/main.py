@@ -1,10 +1,18 @@
 """FastAPI application factory and configuration."""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+import sys
 
-from src.api import health, auth_simple, clusters, services
+from src.api import health, auth_simple, clusters, services, bootstrap
 from src.database import init_db
 from src.config import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.getLogger("sqlalchemy").setLevel(logging.ERROR)
+logging.getLogger("uvicorn.access").setLevel(logging.ERROR)  # Suppress HTTP access logs
+logging.getLogger("src").setLevel(logging.INFO)  # Your application logs - set to DEBUG for verbose
 
 
 def create_app() -> FastAPI:
@@ -26,6 +34,7 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(health.router)
+    app.include_router(bootstrap.router)
     app.include_router(auth_simple.router)
     app.include_router(clusters.router)
     app.include_router(services.router)

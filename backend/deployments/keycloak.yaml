@@ -1,0 +1,83 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: streamlink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:23.0
+        args:
+        - start-dev
+        - --db=postgres
+        - --db-url=jdbc:postgresql://postgres.streamlink.svc.cluster.local:5432/keycloak
+        - --db-username=keycloak
+        - --db-password=PLACEHOLDER_PASSWORD
+        - --hostname-strict=false
+        - --hostname-strict-https=false
+        - --proxy=edge
+        env:
+        - name: KEYCLOAK_ADMIN
+          value: admin
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: PLACEHOLDER_ADMIN_PASSWORD
+        - name: KC_HEALTH_ENABLED
+          value: "true"
+        - name: KC_METRICS_ENABLED
+          value: "true"
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: streamlink
+spec:
+  selector:
+    app: keycloak
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-external
+  namespace: streamlink
+spec:
+  selector:
+    app: keycloak
+  type: NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: KEYCLOAK_NODEPORT
+    name: http
