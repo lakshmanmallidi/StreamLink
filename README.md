@@ -38,12 +38,13 @@ A unified open-source tool for end-to-end event orchestration and Kubernetes ser
 
 ```mermaid
 flowchart LR
-      U[User Browser] --> FE[StreamLink Frontend]
-      FE --> BE[StreamLink Backend (FastAPI)]
-      BE --> DB[(PostgreSQL)]
+      U[User] --> FE[Frontend]
+      FE --> BE[Backend]
       BE --> K8s[Kubernetes API]
+      K8s --> Cluster
 
-      subgraph Kubernetes Cluster
+      subgraph Cluster
+         DB[PostgreSQL]
          KC[Keycloak]
          KF[Kafka]
          SR[Schema Registry]
@@ -52,16 +53,21 @@ flowchart LR
          KUI[Kafbat UI]
       end
 
-      K8s --> KC
-      K8s --> KF
+      BE --> DB
+      BE --> KC
+      DB --> KC
+
       KF --> SR
       KF --> CON
       KF --> KSQL
+      SR --> KSQL
+      CON --> KSQL
+      KF --> KUI
 
-      KUI --> KC
-      KUI --> SR
-      KUI --> CON
-      KUI --> KSQL
+      KC --> KUI
+      SR --> KUI
+      CON --> KUI
+      KSQL --> KUI
 ```
 
 ### Automatic Service Wiring
