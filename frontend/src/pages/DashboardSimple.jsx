@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import iconImage from "../../icon.png";
+import { apiFetch } from "../apiClient";
 
 export default function Dashboard({ children }) {
   const [user, setUser] = useState(null);
@@ -21,30 +22,9 @@ export default function Dashboard({ children }) {
     }
   }, []);
 
-  // Auto-refresh cluster and services status every 5 seconds on dashboard home
-  useEffect(() => {
-    if (location.pathname !== "/") return;
-
-    const interval = setInterval(async () => {
-      // Check actual cluster status first
-      if (clusters.length > 0) {
-        await checkClusterStatus(clusters[0].id);
-      }
-      // Then fetch updated data
-      await fetchClusters();
-      await fetchServices();
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [location.pathname, clusters]);
-
   const checkClusterStatus = async (clusterId) => {
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/clusters/${clusterId}/check-status`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await apiFetch(`/v1/clusters/${clusterId}/check-status`, { method: "POST" });
     } catch (err) {
       console.error("Error checking cluster status:", err);
     }
@@ -52,10 +32,7 @@ export default function Dashboard({ children }) {
 
   const fetchClusters = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/clusters`);
       const data = await response.json();
       setClusters(data);
     } catch (err) {
@@ -65,10 +42,7 @@ export default function Dashboard({ children }) {
 
   const fetchServices = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/services", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/services`);
       const data = await response.json();
       setServices(data);
     } catch (err) {
@@ -76,11 +50,45 @@ export default function Dashboard({ children }) {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("access_token");
-    localStorage.removeItem("user");
-    sessionStorage.removeItem("pkce_code_verifier");
-    window.location.href = "/login";
+  const handleLogout = async () => {
+    try {
+      const idToken = localStorage.getItem("id_token");
+      const accessToken = localStorage.getItem("access_token");
+      
+      // Build logout URL with id_token_hint if available
+      let logoutUrl = `${API_BASE_URL}/v1/auth/logout-url`;
+      if (idToken) {
+        logoutUrl += `?id_token_hint=${idToken}`;
+      }
+      
+      // Get Keycloak logout URL (requires authentication)
+      const response = await fetch(logoutUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const data = await response.json();
+      
+      // Clear local storage AFTER getting logout URL
+      localStorage.removeItem("access_token");
+      localStorage.removeItem("user");
+      localStorage.removeItem("id_token");
+      sessionStorage.removeItem("pkce_code_verifier");
+      
+      // If Keycloak logout URL exists, redirect to it
+      if (data.logout_url) {
+        window.location.href = data.logout_url;
+      } else {
+        // Fallback to local login page
+        window.location.href = "/login";
+      }
+    } catch (err) {
+      console.error("Logout error:", err);
+      // Fallback: clear tokens and go to login
+      localStorage.removeItem("access_token");
+      localStorage.removeItem("user");
+      localStorage.removeItem("id_token");
+      sessionStorage.removeItem("pkce_code_verifier");
+      window.location.href = "/login";
+    }
   };
 
   if (!user) return <div>Loading...</div>;

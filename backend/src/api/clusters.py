@@ -10,6 +10,7 @@ import tempfile
 import os
 import asyncio
 import socket
+import logging
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -18,8 +19,11 @@ import urllib3
 from src.database import get_db
 from src.models.cluster import Cluster
 from src.utils.crypto import get_crypto_service
+from src.api.dependencies import verify_authentication
 
-router = APIRouter(prefix="/v1/clusters", tags=["Clusters"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1/clusters", tags=["Clusters"], dependencies=[Depends(verify_authentication)])
 
 
 class ClusterCreate(BaseModel):
@@ -178,24 +182,26 @@ async def delete_cluster(cluster_id: str, db: AsyncSession = Depends(get_db)):
     return {"message": "Cluster deleted successfully"}
 
 
-def _check_cluster_sync(kubeconfig_path: str):
+def _check_cluster_sync_with_context(cluster):
     """Synchronous cluster check - runs in thread to enable timeout."""
-    config.load_kube_config(config_file=kubeconfig_path)
+    from src.utils.kubernetes import kube_config_context
     
-    # Configure API client with connection timeout
-    configuration = client.Configuration.get_default_copy()
-    configuration.connection_pool_maxsize = 1
-    api_client = client.ApiClient(configuration)
-    
-    # Try to get cluster version - simple health check
-    version_api = client.VersionApi(api_client)
-    version = version_api.get_code()
-    return version
+    with kube_config_context(cluster):
+        # Configure API client with connection timeout
+        configuration = client.Configuration.get_default_copy()
+        configuration.connection_pool_maxsize = 1
+        api_client = client.ApiClient(configuration)
+        
+        # Try to get cluster version - simple health check
+        version_api = client.VersionApi(api_client)
+        version = version_api.get_code()
+        return version
 
 
 @router.post("/{cluster_id}/check-status")
 async def check_cluster_status(cluster_id: str, db: AsyncSession = Depends(get_db)):
     """Check if cluster is up or down by connecting to Kubernetes API."""
+    logger.debug(f"check_cluster_status called for cluster_id: {cluster_id}")
     stmt = select(Cluster).where(Cluster.id == cluster_id)
     result = await db.execute(stmt)
     cluster = result.scalar_one_or_none()
@@ -203,55 +209,38 @@ async def check_cluster_status(cluster_id: str, db: AsyncSession = Depends(get_d
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
     
-    # Decrypt kubeconfig and check cluster health
-    crypto = get_crypto_service()
+    from src.utils.kubernetes import kube_config_context
+    
+    # Check cluster health
+    # Set default socket timeout to prevent hanging
+    socket.setdefaulttimeout(5)
+    
+    # Wrap the blocking k8s call in asyncio timeout
     try:
-        decrypted_kubeconfig = crypto.decrypt(cluster.kubeconfig)
-        
-        # Write kubeconfig to temporary file
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as temp_file:
-            temp_file.write(decrypted_kubeconfig)
-            temp_kubeconfig_path = temp_file.name
-        
-        try:
-            # Set default socket timeout to prevent hanging
-            socket.setdefaulttimeout(5)
-            
-            # Wrap the blocking k8s call in asyncio timeout
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(_check_cluster_sync, temp_kubeconfig_path),
-                    timeout=10.0  # 10 second overall timeout
-                )
-                cluster.status = "up"
-                cluster.last_checked = datetime.utcnow()
-                print(f"Cluster {cluster.name} is up")
-            except asyncio.TimeoutError:
-                cluster.status = "down"
-                cluster.last_checked = datetime.utcnow()
-                print(f"Cluster {cluster.name} timed out - marking as down")
-            except Exception as e:
-                cluster.status = "down"
-                cluster.last_checked = datetime.utcnow()
-                print(f"Cluster {cluster.name} error: {str(e)}")
-            finally:
-                # Reset socket timeout
-                socket.setdefaulttimeout(None)
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_kubeconfig_path):
-                os.unlink(temp_kubeconfig_path)
-    except Exception as e:
-        # Failed to decrypt or process kubeconfig
-        cluster.status = "error"
+        await asyncio.wait_for(
+            asyncio.to_thread(_check_cluster_sync_with_context, cluster),
+            timeout=10.0  # 10 second overall timeout
+        )
+        cluster.status = "up"
         cluster.last_checked = datetime.utcnow()
-        print(f"Failed to process kubeconfig for cluster {cluster.name}: {str(e)}")
+        logger.debug(f"Cluster {cluster.name} is up")
+    except asyncio.TimeoutError:
+        cluster.status = "down"
+        cluster.last_checked = datetime.utcnow()
+        logger.warning(f"Cluster {cluster.name} timed out - marking as down")
+    except Exception as e:
+        cluster.status = "down"
+        cluster.last_checked = datetime.utcnow()
+        logger.error(f"Cluster {cluster.name} error: {str(e)}")
+    finally:
+        # Reset socket timeout
+        socket.setdefaulttimeout(None)
     
     # Always commit the status update
     try:
         await db.commit()
     except Exception as e:
-        print(f"Failed to commit cluster status: {str(e)}")
+        logger.error(f"Failed to commit cluster status: {str(e)}")
         await db.rollback()
     
     return {"status": cluster.status, "last_checked": cluster.last_checked}

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { apiFetch } from "../apiClient";
 
 export default function Clusters() {
   const [cluster, setCluster] = useState(null);
@@ -23,12 +24,7 @@ export default function Clusters() {
 
   const fetchCluster = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      const response = await apiFetch(`/v1/clusters`);
       const data = await response.json();
       setCluster(data.length > 0 ? data[0] : null);
     } catch (err) {
@@ -40,13 +36,7 @@ export default function Clusters() {
 
   const checkStatus = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/clusters/${cluster.id}/check-status`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      await apiFetch(`/v1/clusters/${cluster.id}/check-status`, { method: "POST" });
       fetchCluster();
     } catch (err) {
       console.error("Error checking status:", err);
@@ -57,13 +47,7 @@ export default function Clusters() {
     if (!confirm("Are you sure you want to delete this cluster configuration?")) return;
     
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/clusters/${cluster.id}`, {
-        method: "DELETE",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      await apiFetch(`/v1/clusters/${cluster.id}`, { method: "DELETE" });
       fetchCluster();
     } catch (err) {
       console.error("Error deleting cluster:", err);

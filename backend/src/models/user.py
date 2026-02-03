@@ -1,17 +1,17 @@
 """User database model."""
 from sqlalchemy import Column, String, DateTime, Boolean
-from sqlalchemy.dialects.postgresql import UUID
 import uuid
 from datetime import datetime
 
 from src.database import Base
+from src.models.types import GUID
 
 
 class User(Base):
     """User model for storing authenticated user information."""
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(GUID, primary_key=True, default=uuid.uuid4)
     keycloak_id = Column(String(255), unique=True, nullable=False, index=True)
     email = Column(String(255), nullable=True, index=True)  # Optional for service accounts
     username = Column(String(255), nullable=False)

@@ -8,17 +8,25 @@ from datetime import datetime
 import tempfile
 import os
 import yaml
+import logging
+import asyncio
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from src.database import get_db
+from src.database import get_db, get_database_url
 from src.models.service import Service
 from src.models.cluster import Cluster
+from src.models.bootstrap_state import BootstrapState
 from src.utils.crypto import get_crypto_service
 from src.utils.dependencies import dependency_resolver, SERVICE_DISPLAY_NAMES
+from src.utils.keycloak_admin import keycloak_admin
+from src.api.dependencies import verify_authentication
+from src.config import settings
 
-router = APIRouter(prefix="/v1/services", tags=["Services"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/v1/services", tags=["Services"], dependencies=[Depends(verify_authentication)])
 
 
 class ServiceDeploy(BaseModel):
@@ -58,6 +66,27 @@ class DeploymentPlanResponse(BaseModel):
     dependencies: List[DeploymentPlanItem]
     total_to_install: int
     message: str
+
+
+@router.post("/refresh-deps-config")
+async def refresh_dependencies_config(cluster_id: str, db: AsyncSession = Depends(get_db)):
+    """Refresh and publish all service endpoints to 'streamlink-deps' ConfigMap.
+
+    Ensures internal and external endpoints are discovered for all active services
+    before writing the ConfigMap, so consumers (e.g., kafbat-ui) always find required keys.
+    """
+    # Find cluster
+    stmt = select(Cluster).where(Cluster.id == cluster_id)
+    result = await db.execute(stmt)
+    cluster = result.scalar_one_or_none()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    try:
+        await _update_streamlink_deps_configmap(cluster, db)
+        return {"message": "Dependency ConfigMap refreshed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh ConfigMap: {str(e)}")
 
 
 @router.get("", response_model=List[ServiceResponse])
@@ -187,14 +216,119 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
     if data.name in installed_manifest_names:
         raise HTTPException(status_code=400, detail=f"Service '{data.name}' is already deployed")
     
+    # Ensure global ConfigMap exists with latest config from settings
+    logger.info(f"Ensuring global ConfigMap before deploying '{data.name}'...")
+    try:
+        await _ensure_global_config(cluster)  # Always uses streamlink namespace
+    except Exception as e:
+        logger.error(f"Failed to create ConfigMap: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create global ConfigMap: {str(e)}")
+
+    # Note: Dependency ConfigMaps are created by consumer services (e.g., keycloak) during their deployment.
+    # We intentionally avoid creating consumer-specific config during provider (postgres) deployment.
+    
     # Get missing dependencies
     missing_deps = dependency_resolver.get_missing_dependencies(data.name, installed_manifest_names)
     
+    # Special handling for kafbat-ui: Provision Keycloak client before deployment
+    kafbat_client_id = None
+    kafbat_client_secret = None
+    if data.name == "kafbat-ui":
+        try:
+            logger.info("Provisioning Keycloak client for Kafbat UI...")
+            
+            # Get Keycloak service credentials from database
+            keycloak_stmt = select(Service).where(
+                Service.cluster_id == data.cluster_id,
+                Service.manifest_name == "keycloak",
+                Service.is_active == True
+            )
+            keycloak_result = await db.execute(keycloak_stmt)
+            keycloak_service = keycloak_result.scalar_one_or_none()
+            
+            if not keycloak_service:
+                raise HTTPException(status_code=400, detail="Keycloak service not found. Deploy Keycloak first.")
+            
+            # Create temporary KeycloakAdmin instance using stored credentials
+            from src.utils.keycloak_admin import KeycloakAdmin
+            from src.models.oauth_client import OAuthClient
+            import json
+            
+            keycloak_temp = KeycloakAdmin()
+            if keycloak_service.external_host and keycloak_service.external_port:
+                keycloak_url = f"http://{keycloak_service.external_host}:{keycloak_service.external_port}"
+            elif keycloak_service.internal_host and keycloak_service.internal_port:
+                keycloak_url = f"http://{keycloak_service.internal_host}:{keycloak_service.internal_port}"
+            else:
+                raise HTTPException(status_code=400, detail="Keycloak endpoints not available; deploy Keycloak and wait for readiness")
+            keycloak_temp.base_url = keycloak_url
+            keycloak_temp.realm = "streamlink"
+            crypto = get_crypto_service()
+            try:
+                admin_password = crypto.decrypt(keycloak_service.password) if keycloak_service.password else ""
+            except Exception:
+                admin_password = ""
+            keycloak_temp.admin_password = admin_password
+            logger.info(f"Using Keycloak URL: {keycloak_url}")
+            
+            # Create kafbat-ui client using external URLs derived from cluster node IP
+            # Fallback to settings values if node IP cannot be discovered
+            node_ip = await _get_cluster_node_ip(cluster)
+            if node_ip:
+                base = f"http://{node_ip}:{settings.KAFBAT_UI_NODEPORT}"
+                redirect_uri = f"{base}/login/oauth2/code/keycloak"
+                post_logout_uri = f"{base}/login"
+            else:
+                logger.error("Could not detect cluster node IP; cannot compute Kafbat UI redirect URIs dynamically")
+                raise HTTPException(status_code=500, detail="Failed to compute Kafbat UI redirect URIs: cluster node IP not detected")
+            # Create or update kafbat-ui client with correct redirect URIs
+            kafbat_client_id, kafbat_client_secret = await keycloak_temp.create_client(
+                client_id=settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID,
+                redirect_uris=[redirect_uri],
+                post_logout_uris=[post_logout_uri],
+                description="Kafbat UI - Kafka Management Interface"
+            )
+            # Ensure existing client has up-to-date redirect URIs
+            try:
+                await keycloak_temp.update_client_redirects(
+                    client_id=settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID,
+                    redirect_uris=[redirect_uri],
+                    post_logout_uris=[post_logout_uri],
+                )
+            except Exception as _e:
+                logger.warning(f"Failed to update Kafbat client redirects: {_e}")
+            logger.info(f"Created Keycloak client: {kafbat_client_id}")
+            
+            # Store client credentials in database (encrypted)
+            encrypted_secret = crypto.encrypt(kafbat_client_secret)
+            oauth_client = OAuthClient(
+                client_id=kafbat_client_id,
+                client_secret=encrypted_secret,
+                realm="streamlink",
+                redirect_uris=json.dumps([redirect_uri]),
+                description="Kafbat UI - Kafka Management Interface",
+                is_active=True
+            )
+            db.add(oauth_client)
+            await db.commit()
+            logger.info(f"✓ Stored OAuth client '{kafbat_client_id}' credentials in database (encrypted)")
+
+            # No ConfigMap publishing needed for Kafbat redirect/logout URIs
+            
+            # Create Kubernetes secret with credentials
+            await _create_kafbat_secret(cluster, kafbat_client_secret)
+            logger.info("✓ Kubernetes secret created for Kafbat credentials")
+            
+        except Exception as e:
+            error_msg = f"Failed to provision Keycloak for Kafbat UI: {str(e)}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+    
     # Install missing dependencies first (in order)
     for dep_name in missing_deps:
-        print(f"Installing dependency: {dep_name}")
+        logger.info(f"Installing dependency: {dep_name}")
         try:
-            deployed_name, deployed_namespace = await _deploy_to_kubernetes(cluster, dep_name)
+            deployed_name, deployed_namespace, _ = await _deploy_to_kubernetes(cluster, dep_name)
             
             # Create service record for dependency with both deployed name and manifest name
             dep_service = Service(
@@ -209,22 +343,42 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
             await db.commit()
             await db.refresh(dep_service)
             
-            print(f"Successfully deployed dependency: {deployed_name} in namespace {deployed_namespace}")
+            logger.info(f"Successfully deployed dependency: {deployed_name} in namespace {deployed_namespace}")
+            
+            # Wait for pod to be ready before proceeding
+            logger.info(f"Waiting for {deployed_name} to be ready...")
+            is_ready = await _wait_for_pod_ready(cluster, deployed_name, deployed_namespace)
+            
+            if is_ready:
+                dep_service.status = "running"
+                # Update internal endpoints from K8s metadata
+                await _update_service_internal_endpoints(cluster, dep_service)
+                # Also discover and set external endpoints (NodePort + node IP)
+                await _update_service_external_endpoint(cluster, dep_service)
+                await db.commit()
+                # Update ConfigMap with all service endpoints
+                await _update_streamlink_deps_configmap(cluster, db)
+                logger.info(f"✓ {deployed_name} is ready")
+            else:
+                dep_service.status = "failed"
+                await db.commit()
+                raise HTTPException(status_code=500, detail=f"Dependency {dep_name} failed to start")
+            
             installed_manifest_names.add(dep_name)
             
         except Exception as e:
             error_msg = f"Failed to deploy dependency '{dep_name}': {str(e)}"
-            print(f"ERROR: {error_msg}")
+            logger.error(error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
     
     # Now deploy the target service
     try:
-        print(f"Deploying target service: {data.name}")
-        deployed_name, deployed_namespace = await _deploy_to_kubernetes(cluster, data.name)
-        print(f"Successfully deployed {deployed_name} to Kubernetes in namespace {deployed_namespace}")
+        logger.info(f"Deploying target service: {data.name}")
+        deployed_name, deployed_namespace, metadata = await _deploy_to_kubernetes(cluster, data.name)
+        logger.info(f"Successfully deployed {deployed_name} to Kubernetes in namespace {deployed_namespace}")
     except Exception as e:
         error_msg = f"Failed to deploy {data.name} to Kubernetes: {str(e)}"
-        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
     
     # Create service record for target service with both deployed and manifest names
@@ -241,7 +395,169 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
     await db.commit()
     await db.refresh(service)
     
-    print(f"Service {service.name} and all dependencies deployed successfully.")
+    # Wait for pod to be ready before marking as deployed
+    logger.info(f"Waiting for {deployed_name} to be ready...")
+    is_ready = await _wait_for_pod_ready(cluster, deployed_name, deployed_namespace)
+    
+    if is_ready:
+        service.status = "running"
+        logger.info(f"✓ {deployed_name} is ready")
+        
+        # For postgres, save credentials to service model after pod is running
+        if data.name == "postgres" and metadata.get("postgres_password"):
+            from src.database import AsyncSessionLocal
+            from sqlalchemy import select as sql_select
+            
+            crypto = get_crypto_service()
+            postgres_password = metadata.get("postgres_password")
+            node_ip = metadata.get("node_ip")
+            encrypted_password = crypto.encrypt(postgres_password)
+            
+            # Save credentials to the service record
+            service.username = "postgres"
+            service.password = encrypted_password
+            # Derive internal and external endpoints dynamically from K8s (no hardcoding)
+            await _update_service_internal_endpoints(cluster, service)
+            await _update_service_external_endpoint(cluster, service)
+            
+            # Update bootstrap_state to mark postgres as deployed (only the flag)
+            if "sqlite" in get_database_url().lower():
+                async with AsyncSessionLocal() as session:
+                    stmt = sql_select(BootstrapState)
+                    result = await session.execute(stmt)
+                    bootstrap_state = result.scalar_one_or_none()
+                    
+                    if not bootstrap_state:
+                        bootstrap_state = BootstrapState()
+                        session.add(bootstrap_state)
+                    
+                    bootstrap_state.postgres_deployed = True
+                    await session.commit()
+            
+            logger.info("✓ Postgres is READY - saved credentials to service record")
+            if service.internal_host and service.internal_port:
+                logger.info(f"  Internal: {service.internal_host}:{service.internal_port}")
+            if service.external_host and service.external_port:
+                logger.info(f"  External: {service.external_host}:{service.external_port}")
+        
+        # For keycloak, save credentials to service model after pod is running
+        elif data.name == "keycloak" and metadata.get("keycloak_admin_password"):
+            crypto = get_crypto_service()
+            keycloak_admin_password = metadata.get("keycloak_admin_password")
+            node_ip = metadata.get("node_ip")
+            encrypted_password = crypto.encrypt(keycloak_admin_password)
+            
+            # Save credentials and config to the service record
+            service.username = "admin"
+            service.password = encrypted_password
+            # Derive internal and external endpoints dynamically from K8s (no hardcoding)
+            await _update_service_internal_endpoints(cluster, service)
+            await _update_service_external_endpoint(cluster, service)
+            
+            # Store external URL in config for auth endpoints, if available
+            import json
+            if service.external_host and service.external_port:
+                external_url = f"http://{service.external_host}:{service.external_port}"
+                service.config = json.dumps({"external_url": external_url})
+            
+            logger.info("✓ Keycloak is READY - saved credentials to service record")
+            if service.internal_host and service.internal_port:
+                logger.info(f"  Internal: {service.internal_host}:{service.internal_port}")
+            if service.external_host and service.external_port:
+                logger.info(f"  External: {service.external_host}:{service.external_port}")
+        else:
+            # For other services, update internal endpoints and attempt external discovery
+            await _update_service_internal_endpoints(cluster, service)
+            await _update_service_external_endpoint(cluster, service)
+        
+        # Update ConfigMap with all service endpoints after service is running
+        await _update_streamlink_deps_configmap(cluster, db)
+    else:
+        service.status = "failed"
+        logger.error(f"✗ {deployed_name} failed to become ready")
+        raise HTTPException(status_code=500, detail=f"Service {data.name} failed to start")
+    
+    await db.commit()
+    
+    # Special handling for keycloak: Initialize realm after deployment
+    if data.name == "keycloak":
+        try:
+            logger.info("Waiting for Keycloak to be ready before initializing realm...")
+            import asyncio
+            await asyncio.sleep(30)  # Wait for Keycloak to start up
+            
+            logger.info("Initializing Keycloak realm...")
+            from src.utils.keycloak_admin import KeycloakAdmin
+            from src.models.oauth_client import OAuthClient
+            import json
+            
+            # Create temporary KeycloakAdmin instance using stored credentials
+            # Prefer external URL; else build from discovered internal host/port
+            keycloak_temp = KeycloakAdmin()
+            if service.external_host and service.external_port:
+                keycloak_url = f"http://{service.external_host}:{service.external_port}"
+            elif service.internal_host and service.internal_port:
+                keycloak_url = f"http://{service.internal_host}:{service.internal_port}"
+            else:
+                raise HTTPException(status_code=400, detail="Keycloak endpoints not available after deployment")
+            keycloak_temp.base_url = keycloak_url
+            crypto = get_crypto_service()
+            try:
+                admin_password = crypto.decrypt(service.password) if service.password else ""
+            except Exception:
+                admin_password = ""
+            keycloak_temp.admin_password = admin_password
+            logger.info(f"Using Keycloak URL: {keycloak_url}")
+            
+            # Create the streamlink realm
+            await keycloak_temp.create_realm("streamlink", "StreamLink Platform")
+            logger.info("Keycloak realm 'streamlink' created successfully")
+            
+            # Update keycloak instance to use new realm
+            keycloak_temp.realm = "streamlink"
+            
+            # Create streamlink-api client with redirect URI from config
+            api_client_id, api_client_secret = await keycloak_temp.create_client(
+                client_id=settings.KEYCLOAK_STREAMLINK_API_CLIENT_ID,
+                redirect_uris=[settings.KEYCLOAK_STREAMLINK_API_REDIRECT_URI],
+                post_logout_uris=[settings.KEYCLOAK_STREAMLINK_API_POST_LOGOUT_URI],
+                description="StreamLink API Client"
+            )
+            logger.info(f"Created Keycloak client: {api_client_id}")
+            
+            # Store client credentials in database (encrypted)
+            encrypted_secret = crypto.encrypt(api_client_secret)
+            oauth_client = OAuthClient(
+                client_id=api_client_id,
+                client_secret=encrypted_secret,
+                realm="streamlink",
+                redirect_uris=json.dumps([settings.KEYCLOAK_STREAMLINK_API_REDIRECT_URI]),
+                description="StreamLink API Client",
+                is_active=True
+            )
+            db.add(oauth_client)
+            await db.commit()
+            logger.info(f"✓ Stored OAuth client '{api_client_id}' credentials in database (encrypted)")
+            
+            # Mark Keycloak as deployed in bootstrap state (works for both SQLite and Postgres)
+            stmt = select(BootstrapState)
+            result = await db.execute(stmt)
+            bootstrap_state = result.scalar_one_or_none()
+            
+            if not bootstrap_state:
+                bootstrap_state = BootstrapState()
+                db.add(bootstrap_state)
+            
+            bootstrap_state.keycloak_deployed = True
+            await db.commit()
+            logger.info("✓ Marked Keycloak as deployed in bootstrap state - OAuth authentication is now active")
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize Keycloak realm (you can do this manually later): {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    logger.info(f"Service {service.name} and all dependencies deployed successfully.")
     
     return ServiceResponse(
         id=str(service.id),
@@ -359,39 +675,173 @@ async def delete_service(service_id: str, cascade: bool = False, db: AsyncSessio
     
     deleted_services = []
     
-    # Delete dependent services first (in reverse dependency order)
+    # STEP 1: Update database first (before K8s deletion)
+    # Delete dependent services from database first
     if cascade and dependent_services:
-        print(f"Cascading delete: will delete {len(dependent_services)} dependent service(s)")
+        logger.info(f"Cascading delete: marking {len(dependent_services)} dependent service(s) as deleted in database")
         for dep_svc in dependent_services:
-            if cluster:
-                try:
-                    print(f"Deleting dependent service '{dep_svc.name}' from namespace '{dep_svc.namespace}'")
-                    await _delete_from_kubernetes(cluster, dep_svc)
-                    print(f"Successfully deleted dependent service '{dep_svc.name}'")
-                except Exception as e:
-                    print(f"ERROR: Failed to delete dependent service: {type(e).__name__}: {e}")
-            
             dep_svc.is_active = False
             dep_svc.status = "deleted"
             deleted_services.append(dep_svc.display_name)
     
-    # Delete the target service
-    if cluster:
-        try:
-            print(f"Attempting to delete service '{service.name}' from namespace '{service.namespace}'")
-            await _delete_from_kubernetes(cluster, service)
-            print(f"Successfully deleted service '{service.name}' from Kubernetes")
-        except Exception as e:
-            print(f"ERROR: Failed to delete from Kubernetes: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-    else:
-        print(f"Warning: No cluster found for service {service.id}, skipping Kubernetes deletion")
-    
+    # Mark target service as deleted in database
     service.is_active = False
     service.status = "deleted"
     deleted_services.append(service.display_name)
+    
+    # Special handling for postgres: Delete bootstrap_state and update services table in SQLite
+    if service.manifest_name == "postgres":
+        logger.info("Postgres service deleted - cleaning up SQLite database")
+        
+        # Connect directly to SQLite to clean up
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(__file__), "..", "..", "bootstrap.db")
+        
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Delete bootstrap_state
+            cursor.execute("DELETE FROM bootstrap_state")
+            logger.info("Deleted bootstrap_state from SQLite")
+            
+            # Mark postgres service as deleted in services table
+            cursor.execute("""
+                UPDATE services 
+                SET is_active = 0, status = 'deleted' 
+                WHERE manifest_name = 'postgres'
+            """)
+            logger.info("Marked postgres service as deleted in SQLite services table")
+            
+            conn.commit()
+            conn.close()
+            logger.info("SQLite cleanup complete - backend will use SQLite on restart")
+        except Exception as e:
+            logger.error(f"Failed to clean up SQLite: {e}")
+            # Continue anyway - worst case user needs to delete bootstrap.db manually
+    
+    # Commit database changes first
     await db.commit()
+    logger.info("Database updated - services marked as deleted")
+    
+    # STEP 2: Now delete from Kubernetes (if this fails, database is already updated)
+    # Delete dependent services from Kubernetes
+    if cascade and dependent_services:
+        logger.info(f"Deleting {len(dependent_services)} dependent service(s) from Kubernetes")
+        for dep_svc in dependent_services:
+            if cluster:
+                try:
+                    logger.info(f"Deleting dependent service '{dep_svc.name}' from namespace '{dep_svc.namespace}'")
+                    await _delete_from_kubernetes(cluster, dep_svc)
+                    logger.info(f"Successfully deleted dependent service '{dep_svc.name}'")
+                except Exception as e:
+                    logger.error(f"Failed to delete dependent service from K8s: {type(e).__name__}: {e}")
+    
+    # Delete the target service from Kubernetes
+    if cluster:
+        try:
+            logger.info(f"Attempting to delete service '{service.name}' from namespace '{service.namespace}'")
+            await _delete_from_kubernetes(cluster, service)
+            logger.info(f"Successfully deleted service '{service.name}' from Kubernetes")
+            
+            # Special handling for kafbat-ui: Delete Keycloak client
+            if service.manifest_name == "kafbat-ui":
+                try:
+                    from src.models.oauth_client import OAuthClient
+                    # Ensure KeycloakAdmin has a base_url derived from service record (no hardcoded fallback)
+                    try:
+                        keycloak_stmt = select(Service).where(
+                            Service.cluster_id == service.cluster_id,
+                            Service.manifest_name == "keycloak",
+                            Service.is_active == True
+                        )
+                        keycloak_result = await db.execute(keycloak_stmt)
+                        keycloak_svc = keycloak_result.scalar_one_or_none()
+                        if keycloak_svc:
+                            if keycloak_svc.external_host and keycloak_svc.external_port:
+                                keycloak_admin.base_url = f"http://{keycloak_svc.external_host}:{keycloak_svc.external_port}"
+                            elif keycloak_svc.internal_host and keycloak_svc.internal_port:
+                                keycloak_admin.base_url = f"http://{keycloak_svc.internal_host}:{keycloak_svc.internal_port}"
+                    except Exception:
+                        pass
+                    
+                    logger.info(f"Deleting Keycloak client: {settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID}")
+                    deleted = await keycloak_admin.delete_client(settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID)
+                    if deleted:
+                        logger.info(f"Keycloak client deleted: {settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID}")
+                    else:
+                        logger.warning(f"Keycloak client not found: {settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID}")
+                    
+                    # Delete OAuth client from database
+                    logger.info("Deleting Kafbat OAuth client from database...")
+                    oauth_stmt = select(OAuthClient).where(OAuthClient.client_id == settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID)
+                    oauth_result = await db.execute(oauth_stmt)
+                    oauth_client = oauth_result.scalar_one_or_none()
+                    if oauth_client:
+                        await db.delete(oauth_client)
+                        await db.commit()
+                        logger.info(f"✓ Deleted OAuth client from database: {settings.KEYCLOAK_KAFBAT_UI_CLIENT_ID}")
+                    
+                    # Delete Kubernetes secret
+                    logger.info("Deleting Kubernetes secret for Kafbat credentials...")
+                    await _delete_kafbat_secret(cluster)
+                    logger.info("✓ Kubernetes secret deleted")
+                    
+                except Exception as e:
+                    logger.error(f"Keycloak cleanup failed: {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Don't fail the delete operation if Keycloak cleanup fails
+            
+            # Special handling for keycloak: Delete OAuth clients from database and reset bootstrap flag
+            if service.manifest_name == "keycloak":
+                try:
+                    from src.models.oauth_client import OAuthClient
+                    logger.info("Cleaning up Keycloak OAuth clients from database...")
+                    
+                    # Delete all OAuth clients
+                    stmt = select(OAuthClient)
+                    result = await db.execute(stmt)
+                    oauth_clients = result.scalars().all()
+                    
+                    for client in oauth_clients:
+                        await db.delete(client)
+                        logger.info(f"Deleted OAuth client: {client.client_id}")
+                    
+                    # Reset keycloak_deployed flag in bootstrap_state
+                    stmt = select(BootstrapState)
+                    result = await db.execute(stmt)
+                    bootstrap_state = result.scalar_one_or_none()
+                    
+                    if bootstrap_state:
+                        bootstrap_state.keycloak_deployed = False
+                        logger.info("Reset keycloak_deployed flag in bootstrap_state")
+                    
+                    await db.commit()
+                    logger.info("Keycloak cleanup completed - OAuth authentication disabled")
+                    
+                except Exception as e:
+                    logger.error(f"Keycloak database cleanup failed: {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Don't fail the delete operation
+                    
+        except Exception as e:
+            logger.error(f"Failed to delete from Kubernetes: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't raise - database is already updated
+    else:
+        logger.warning(f"No cluster found for service {service.id}, skipping Kubernetes deletion")
+    
+    # Prepare response with restart warning for postgres
+    if service.manifest_name == "postgres":
+        return {
+            "message": "Postgres deleted successfully. ⚠️ RESTART REQUIRED: Please restart the backend immediately to switch to SQLite.",
+            "deleted_services": deleted_services,
+            "restart_required": True,
+            "warning": "Backend will fail with connection errors until restarted"
+        }
     
     if len(deleted_services) > 1:
         return {
@@ -405,6 +855,7 @@ async def delete_service(service_id: str, cascade: bool = False, db: AsyncSessio
 @router.post("/{service_id}/check-status")
 async def check_service_status(service_id: str, db: AsyncSession = Depends(get_db)):
     """Check service status in Kubernetes."""
+    logger.debug(f"check_service_status called for service_id: {service_id}")
     stmt = select(Service).where(Service.id == service_id)
     result = await db.execute(stmt)
     service = result.scalar_one_or_none()
@@ -439,23 +890,81 @@ async def check_service_status(service_id: str, db: AsyncSession = Depends(get_d
     }
 
 
-async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[str, str]:
-    """Deploy service to Kubernetes cluster using YAML manifest.
-    Returns (deployed_name, deployed_namespace) tuple.
+async def _wait_for_pod_ready(cluster: Cluster, service_name: str, namespace: str = "streamlink", timeout: int = 300):
+    """Wait for pod to be in Running state with all containers ready.
+    Returns True if ready, False if timeout.
     """
+    import time
+    from src.utils.kubernetes import kube_config_context
+    
+    start_time = time.time()
+    logger.info(f"Waiting for {service_name} pod to be ready (timeout: {timeout}s)...")
+    
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+        
+        while (time.time() - start_time) < timeout:
+            try:
+                # List pods with label selector
+                pods = core_v1.list_namespaced_pod(
+                    namespace=namespace,
+                    label_selector=f"app={service_name}"
+                )
+                
+                if not pods.items:
+                    logger.debug(f"No pods found for {service_name}, waiting...")
+                    await asyncio.sleep(5)
+                    continue
+                
+                pod = pods.items[0]
+                
+                # Check pod phase
+                if pod.status.phase == "Running":
+                    # Check if all containers are ready
+                    all_ready = True
+                    if pod.status.container_statuses:
+                        for container in pod.status.container_statuses:
+                            if not container.ready:
+                                all_ready = False
+                                break
+                    
+                    if all_ready:
+                        logger.info(f"✓ {service_name} pod is ready")
+                        return True
+                    else:
+                        logger.debug(f"{service_name} pod is Running but containers not ready yet")
+                elif pod.status.phase in ["Failed", "Unknown"]:
+                    logger.error(f"{service_name} pod is in {pod.status.phase} state")
+                    return False
+                else:
+                    logger.debug(f"{service_name} pod phase: {pod.status.phase}")
+                
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"Error checking pod status: {e}")
+            
+            await asyncio.sleep(5)
+        
+        logger.warning(f"Timeout waiting for {service_name} pod to be ready")
+        return False
+
+
+async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[str, str, dict]:
+    """Deploy service to Kubernetes cluster using YAML manifest.
+    Returns (deployed_name, deployed_namespace, metadata) tuple.
+    metadata contains service-specific data like passwords, endpoints, etc.
+    """
+    import secrets
+    import string
+    from sqlalchemy import select as sql_select
+    from src.models.bootstrap_state import BootstrapState
+    from src.utils.kubernetes import kube_config_context
+    
     crypto = get_crypto_service()
-    decrypted_kubeconfig = crypto.decrypt(cluster.kubeconfig)
-    
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as temp_file:
-        temp_file.write(decrypted_kubeconfig)
-        temp_kubeconfig_path = temp_file.name
-    
     deployed_namespace = None
     deployed_name = None
     
-    try:
-        config.load_kube_config(config_file=temp_kubeconfig_path)
-        
+    with kube_config_context(cluster):
         # Load YAML manifest for the service
         manifest_path = os.path.join(
             os.path.dirname(__file__), 
@@ -470,6 +979,268 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
         # Read and apply the YAML manifest
         with open(manifest_path, 'r') as f:
             manifest_content = f.read()
+        
+        # No more string replacements - NodePorts come from ConfigMap
+        
+        # Special handling for postgres and keycloak - generate passwords and create secrets
+        postgres_password = None
+        keycloak_admin_password = None
+        keycloak_client_secret = None
+        
+        if service_name == "postgres":
+            logger.info("Generating password for Postgres deployment")
+            alphabet = string.ascii_letters + string.digits + string.punctuation
+            postgres_password = ''.join(secrets.choice(alphabet) for _ in range(32))
+            
+            # Create Kubernetes Secret for Postgres
+            core_v1 = client.CoreV1Api()
+            secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name="postgres-secret", namespace="streamlink"),
+                string_data={
+                    "postgres-password": postgres_password
+                }
+            )
+            
+            try:
+                core_v1.create_namespaced_secret(namespace="streamlink", body=secret)
+                logger.info("✓ Created Kubernetes Secret 'postgres-secret'")
+            except ApiException as e:
+                if e.status == 409:  # Already exists, update it
+                    core_v1.patch_namespaced_secret(name="postgres-secret", namespace="streamlink", body=secret)
+                    logger.info("✓ Updated Kubernetes Secret 'postgres-secret'")
+                else:
+                    raise
+            
+        elif service_name == "keycloak":
+            logger.info("Generating admin password for Keycloak deployment")
+            # Use a safe alphabet that avoids shell/SQL-breaking characters (' " \ $)
+            safe_punct = "@#%+=-_.:,;!?"  # excludes quotes, backslash, dollar
+            alphabet = string.ascii_letters + string.digits + safe_punct
+            keycloak_admin_password = ''.join(secrets.choice(alphabet) for _ in range(32))
+            
+            core_v1 = client.CoreV1Api()
+            
+            # 1) Ensure Keycloak admin secret
+            admin_secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name="keycloak-secrets", namespace="streamlink"),
+                string_data={
+                    "admin-password": keycloak_admin_password
+                }
+            )
+            try:
+                core_v1.create_namespaced_secret(namespace="streamlink", body=admin_secret)
+                logger.info("✓ Created Kubernetes Secret 'keycloak-secrets'")
+            except ApiException as e:
+                if e.status == 409:
+                    core_v1.patch_namespaced_secret(name="keycloak-secrets", namespace="streamlink", body=admin_secret)
+                    logger.info("✓ Updated Kubernetes Secret 'keycloak-secrets'")
+                else:
+                    raise
+
+            # 2) Create dependency secrets for consumers (postgres superuser password for init)
+            # Read postgres password from existing secret (preferred) or DB service record
+            pg_root_password = ""
+            try:
+                existing_pg = core_v1.read_namespaced_secret(name="postgres-secret", namespace="streamlink")
+                if getattr(existing_pg, 'data', None) and existing_pg.data.get("postgres-password"):
+                    import base64
+                    pg_root_password = base64.b64decode(existing_pg.data["postgres-password"]).decode("utf-8")
+            except ApiException:
+                pass
+            if not pg_root_password:
+                from src.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as session:
+                    res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                    pg_service = res.scalar_one_or_none()
+                    if pg_service and pg_service.password:
+                        crypto_local = get_crypto_service()
+                        try:
+                            pg_root_password = crypto_local.decrypt(pg_service.password)
+                        except Exception:
+                            pg_root_password = ""
+
+            deps_secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name="streamlink-deps-secrets", namespace="streamlink"),
+                string_data={
+                    "postgres_password": pg_root_password
+                }
+            )
+            try:
+                core_v1.create_namespaced_secret(namespace="streamlink", body=deps_secret)
+                logger.info("✓ Created Kubernetes Secret 'streamlink-deps-secrets'")
+            except ApiException as e:
+                if e.status == 409:
+                    core_v1.patch_namespaced_secret(name="streamlink-deps-secrets", namespace="streamlink", body=deps_secret)
+                    logger.info("✓ Updated Kubernetes Secret 'streamlink-deps-secrets'")
+                else:
+                    raise
+
+            # 3) Ensure dependency ConfigMap has Postgres internal host/port for init Job (merge only)
+            # Try to read postgres secret to ensure connectivity; if missing, recreate from DB service
+            try:
+                core_v1.read_namespaced_secret(name="postgres-secret", namespace="streamlink")
+            except ApiException as e:
+                if e.status == 404:
+                    logger.info("postgres-secret missing; attempting to recreate from DB service record")
+                    from src.database import AsyncSessionLocal
+                    async with AsyncSessionLocal() as session:
+                        res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                        pg_service = res.scalar_one_or_none()
+                        if pg_service and pg_service.password:
+                            crypto_local = get_crypto_service()
+                            try:
+                                pg_password_plain = crypto_local.decrypt(pg_service.password)
+                            except Exception:
+                                pg_password_plain = ""
+                            if pg_password_plain:
+                                pg_secret = client.V1Secret(
+                                    metadata=client.V1ObjectMeta(name="postgres-secret", namespace="streamlink"),
+                                    string_data={"postgres-password": pg_password_plain}
+                                )
+                                try:
+                                    core_v1.create_namespaced_secret(namespace="streamlink", body=pg_secret)
+                                    logger.info("✓ Recreated 'postgres-secret' from DB")
+                                except ApiException as e2:
+                                    if e2.status == 409:
+                                        core_v1.patch_namespaced_secret(name="postgres-secret", namespace="streamlink", body=pg_secret)
+                                        logger.info("✓ Updated 'postgres-secret' from DB")
+                                    else:
+                                        raise
+                        else:
+                            logger.warning("Postgres service record not found or no password stored; proceeding")
+                else:
+                    raise
+
+            # Build ConfigMap data (internal host/port) without hardcoded defaults
+            postgres_host = None
+            postgres_port = None
+            from src.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                pg_service = res.scalar_one_or_none()
+                if pg_service:
+                    # Prefer discovered internal endpoint; fallback to service name (same-namespace DNS)
+                    postgres_host = pg_service.internal_host or pg_service.name
+                    postgres_port = pg_service.internal_port
+                    if not postgres_port:
+                        try:
+                            svc_obj = core_v1.read_namespaced_service(name=pg_service.name, namespace="streamlink")
+                            if svc_obj.spec.ports and len(svc_obj.spec.ports) > 0:
+                                postgres_port = str(svc_obj.spec.ports[0].port)
+                        except ApiException:
+                            pass
+            # Ensure we resolved required values before publishing
+            if not postgres_host or not postgres_port:
+                logger.error("Cannot publish Postgres connection info: missing host/port from Kubernetes")
+                raise RuntimeError("Postgres service endpoints not available")
+            # Merge-only update of 'streamlink-deps' to avoid wiping other keys
+            try:
+                existing_cm = core_v1.read_namespaced_config_map(name="streamlink-deps", namespace="streamlink")
+                data = existing_cm.data or {}
+                data.update({
+                    "postgres_internal_host": postgres_host,
+                    "postgres_internal_port": postgres_port
+                })
+                existing_cm.data = data
+                core_v1.replace_namespaced_config_map(name="streamlink-deps", namespace="streamlink", body=existing_cm)
+                logger.info("✓ Merged Postgres keys into ConfigMap 'streamlink-deps'")
+            except ApiException as e:
+                if e.status == 404:
+                    cm = client.V1ConfigMap(
+                        metadata=client.V1ObjectMeta(name="streamlink-deps", namespace="streamlink"),
+                        data={
+                            "postgres_internal_host": postgres_host,
+                            "postgres_internal_port": postgres_port
+                        }
+                    )
+                    core_v1.create_namespaced_config_map(namespace="streamlink", body=cm)
+                    logger.info("✓ Created ConfigMap 'streamlink-deps' with Postgres keys")
+                else:
+                    raise
+
+            # 4) Run init Job to create keycloak user and database
+            from kubernetes.client import V1EnvVar
+            job_manifest = {
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "keycloak-db-init", "namespace": "streamlink"},
+                "spec": {
+                    "backoffLimit": 2,
+                    "template": {
+                        "metadata": {"labels": {"app": "keycloak-db-init"}},
+                        "spec": {
+                            "restartPolicy": "Never",
+                            "containers": [
+                                {
+                                    "name": "psql",
+                                    "image": "postgres:15-alpine",
+                                    "env": [
+                                        {"name": "POSTGRES_HOST", "valueFrom": {"configMapKeyRef": {"name": "streamlink-deps", "key": "postgres_internal_host"}}},
+                                        {"name": "PGPASSWORD", "valueFrom": {"secretKeyRef": {"name": "streamlink-deps-secrets", "key": "postgres_password"}}},
+                                        {"name": "KEYCLOAK_DB_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "keycloak-secrets", "key": "admin-password"}}}
+                                    ],
+                                    "command": ["sh","-c"],
+                                    "args": [
+                                        "ESC_PWD=$(printf %s \"$KEYCLOAK_DB_PASSWORD\" | sed \"s/'/''/g\"); DB_EXISTS=$(psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='keycloak'\"); if [ \"$DB_EXISTS\" = \"1\" ]; then echo 'Dropping existing keycloak database to reset with new password...'; psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"DROP DATABASE keycloak\"; fi; ROLE_EXISTS=$(psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='keycloak'\"); if [ \"$ROLE_EXISTS\" != \"1\" ]; then psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"CREATE USER keycloak WITH PASSWORD '$ESC_PWD'\"; else psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"ALTER USER keycloak WITH PASSWORD '$ESC_PWD'\"; fi; psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"CREATE DATABASE keycloak OWNER keycloak\""
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            from kubernetes import utils as k8s_utils
+            from kubernetes.client import BatchV1Api
+            k8s_client = client.ApiClient()
+            batch_v1 = BatchV1Api()
+
+            # Ensure idempotency: delete existing job if present, wait for deletion
+            try:
+                batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                logger.info("Existing Job 'keycloak-db-init' found; deleting before recreate")
+                batch_v1.delete_namespaced_job(name="keycloak-db-init", namespace="streamlink", propagation_policy="Foreground")
+                import time
+                start_del = time.time()
+                while time.time() - start_del < 60:
+                    try:
+                        batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                        time.sleep(2)
+                    except ApiException as e:
+                        if e.status == 404:
+                            break
+                        else:
+                            raise
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+
+            # Create Job
+            k8s_utils.create_from_dict(k8s_client, job_manifest)
+            logger.info("✓ Created Job 'keycloak-db-init'")
+
+            # Wait for job completion
+            from kubernetes.client import BatchV1Api
+            batch_v1 = BatchV1Api()
+            import time
+            start = time.time()
+            while time.time() - start < 180:
+                job = batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                if job.status.succeeded and job.status.succeeded >= 1:
+                    logger.info("✓ Keycloak DB init job succeeded")
+                    break
+                if job.status.failed and job.status.failed >= 1:
+                    logger.error("✗ Keycloak DB init job failed")
+                    raise RuntimeError("Keycloak DB initialization failed")
+                await asyncio.sleep(5)
+            
+            # Clean up the job after completion
+            try:
+                batch_v1.delete_namespaced_job(name="keycloak-db-init", namespace="streamlink", propagation_policy="Background")
+                logger.info("✓ Deleted Job 'keycloak-db-init' after completion")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"Failed to delete Job 'keycloak-db-init': {e}")
+
         
         # Apply the manifest using kubectl-like approach - respect namespace from YAML
         from kubernetes import utils
@@ -490,6 +1261,8 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
                 # Capture the actual deployed name from Deployment/StatefulSet resources
                 if kind in ['Deployment', 'StatefulSet'] and 'name' in doc['metadata']:
                     deployed_name = doc['metadata']['name']
+
+            # No dynamic env injection; YAML consumes ConfigMap and Secrets directly
             
             # Apply based on resource type
             if kind == "Namespace":
@@ -498,6 +1271,22 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
                     core_v1.create_namespace(body=doc)
                 except ApiException as e:
                     if e.status != 409:  # Ignore if already exists
+                        raise
+            elif kind == "PersistentVolumeClaim":
+                core_v1 = client.CoreV1Api()
+                try:
+                    core_v1.create_namespaced_persistent_volume_claim(
+                        namespace=doc['metadata']['namespace'],
+                        body=doc
+                    )
+                except ApiException as e:
+                    if e.status == 409:  # Already exists, update instead
+                        core_v1.patch_namespaced_persistent_volume_claim(
+                            name=doc['metadata']['name'],
+                            namespace=doc['metadata']['namespace'],
+                            body=doc
+                        )
+                    else:
                         raise
             elif kind == "StatefulSet":
                 apps_v1 = client.AppsV1Api()
@@ -547,83 +1336,153 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
                         )
                     else:
                         raise
-    finally:
-        if os.path.exists(temp_kubeconfig_path):
-            os.unlink(temp_kubeconfig_path)
     
-    return deployed_name or service_name, deployed_namespace or "default"
+    # Save passwords and endpoints to bootstrap state
+    from src.database import AsyncSessionLocal, get_database_url
+    
+    async with AsyncSessionLocal() as session:
+        stmt = sql_select(BootstrapState)
+        result = await session.execute(stmt)
+        bootstrap_state = result.scalar_one_or_none()
+        
+        if not bootstrap_state:
+            bootstrap_state = BootstrapState()
+            session.add(bootstrap_state)
+        
+        # Get node IP for external access
+        from src.utils.kubernetes import get_node_ip
+        node_ip = get_node_ip(cluster)
+        if not node_ip:
+            logger.warning("Could not get node IP")
+        
+        # Prepare metadata to return (will be saved after pod is ready)
+        metadata = {}
+        
+        if service_name == "postgres" and postgres_password:
+            metadata["postgres_password"] = postgres_password
+            metadata["node_ip"] = node_ip
+            
+        elif service_name == "keycloak" and keycloak_admin_password:
+            # Pass admin password and node info via metadata; actual DB save occurs after pod is ready
+            metadata["keycloak_admin_password"] = keycloak_admin_password
+            metadata["node_ip"] = node_ip
+        
+        await session.commit()
+    
+    return deployed_name or service_name, deployed_namespace or "streamlink", metadata
 
 
 async def _delete_from_kubernetes(cluster: Cluster, service: Service):
-    """Delete service from Kubernetes cluster."""
-    crypto = get_crypto_service()
-    decrypted_kubeconfig = crypto.decrypt(cluster.kubeconfig)
+    """Delete service from Kubernetes cluster.
+    Deletes all related resources: Deployment/StatefulSet, Services, PVCs, and Secrets.
+    """
+    from src.utils.kubernetes import kube_config_context
     
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as temp_file:
-        temp_file.write(decrypted_kubeconfig)
-        temp_kubeconfig_path = temp_file.name
-    
-    try:
-        config.load_kube_config(config_file=temp_kubeconfig_path)
+    with kube_config_context(cluster):
         apps_v1 = client.AppsV1Api()
         core_v1 = client.CoreV1Api()
         
-        print(f"Deleting deployment/statefulset '{service.name}' from namespace '{service.namespace}'")
-        # Try to delete deployment first
+        service_name = service.name
+        namespace = service.namespace
+        
+        logger.info(f"Deleting all resources for '{service_name}' from namespace '{namespace}'")
+        
+        # 1. Delete Deployment or StatefulSet
+        logger.info(f"Deleting deployment/statefulset '{service_name}'")
         try:
             apps_v1.delete_namespaced_deployment(
-                name=service.name,
-                namespace=service.namespace,
+                name=service_name,
+                namespace=namespace,
                 propagation_policy='Foreground'
             )
-            print(f"Deployment '{service.name}' deletion initiated")
+            logger.info(f"✓ Deployment '{service_name}' deletion initiated")
         except ApiException as e:
             if e.status == 404:
                 # Not a deployment, try statefulset
                 try:
                     apps_v1.delete_namespaced_stateful_set(
-                        name=service.name,
-                        namespace=service.namespace,
+                        name=service_name,
+                        namespace=namespace,
                         propagation_policy='Foreground'
                     )
-                    print(f"StatefulSet '{service.name}' deletion initiated")
+                    logger.info(f"✓ StatefulSet '{service_name}' deletion initiated")
                 except ApiException as e2:
                     if e2.status == 404:
-                        print(f"Deployment/StatefulSet '{service.name}' not found (already deleted)")
+                        logger.debug(f"Deployment/StatefulSet '{service_name}' not found")
                     else:
                         raise
             else:
                 raise
         
-        print(f"Deleting service '{service.name}' from namespace '{service.namespace}'")
-        # Delete service
+        # 2. Delete ClusterIP Service
+        logger.info(f"Deleting service '{service_name}'")
         try:
             core_v1.delete_namespaced_service(
-                name=service.name,
-                namespace=service.namespace
+                name=service_name,
+                namespace=namespace
             )
-            print(f"Service '{service.name}' deletion initiated")
+            logger.info(f"✓ Service '{service_name}' deletion initiated")
         except ApiException as e:
             if e.status == 404:
-                print(f"Service '{service.name}' not found (already deleted)")
+                logger.debug(f"Service '{service_name}' not found")
             else:
                 raise
-    finally:
-        if os.path.exists(temp_kubeconfig_path):
-            os.unlink(temp_kubeconfig_path)
+        
+        # 3. Delete External Service (NodePort) - common pattern: {service}-external
+        external_service_name = f"{service_name}-external"
+        logger.info(f"Deleting external service '{external_service_name}'")
+        try:
+            core_v1.delete_namespaced_service(
+                name=external_service_name,
+                namespace=namespace
+            )
+            logger.info(f"✓ Service '{external_service_name}' deletion initiated")
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug(f"External service '{external_service_name}' not found")
+            else:
+                logger.warning(f"Failed to delete external service: {e}")
+        
+        # 4. Delete PersistentVolumeClaim - common pattern: {service}-pvc
+        pvc_name = f"{service_name}-pvc"
+        logger.info(f"Deleting PVC '{pvc_name}'")
+        try:
+            core_v1.delete_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace
+            )
+            logger.info(f"✓ PVC '{pvc_name}' deletion initiated")
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug(f"PVC '{pvc_name}' not found")
+            else:
+                logger.warning(f"Failed to delete PVC: {e}")
+        
+        # 5. Delete Secret - common pattern: {service}-secret
+        secret_name = f"{service_name}-secret"
+        logger.info(f"Deleting secret '{secret_name}'")
+        try:
+            core_v1.delete_namespaced_secret(
+                name=secret_name,
+                namespace=namespace
+            )
+            logger.info(f"✓ Secret '{secret_name}' deletion initiated")
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug(f"Secret '{secret_name}' not found")
+            else:
+                logger.warning(f"Failed to delete secret: {e}")
+        
+        logger.info(f"✓ All resources for '{service_name}' deleted successfully")
 
 
 async def _check_kubernetes_status(cluster: Cluster, service: Service):
     """Check service status in Kubernetes by examining pod health."""
-    crypto = get_crypto_service()
-    decrypted_kubeconfig = crypto.decrypt(cluster.kubeconfig)
+    from src.utils.kubernetes import kube_config_context
     
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.yaml') as temp_file:
-        temp_file.write(decrypted_kubeconfig)
-        temp_kubeconfig_path = temp_file.name
+    logger.debug(f"Checking status for service: {service.name} in namespace: {service.namespace}")
     
-    try:
-        config.load_kube_config(config_file=temp_kubeconfig_path)
+    with kube_config_context(cluster):
         apps_v1 = client.AppsV1Api()
         core_v1 = client.CoreV1Api()
         
@@ -667,8 +1526,8 @@ async def _check_kubernetes_status(cluster: Cluster, service: Service):
                 return {"status": "pending", "replicas": f"0/{desired_replicas}"}
             
             # Debug logging
-            print(f"\n=== Checking status for {service.name} in namespace {service.namespace} ===")
-            print(f"Found {len(pods.items)} pod(s)")
+            logger.debug(f"\n=== Checking status for {service.name} in namespace {service.namespace} ===")
+            logger.debug(f"Found {len(pods.items)} pod(s)")
             
             # Collect status from all pods/containers before deciding
             has_crash_loop = False
@@ -679,56 +1538,56 @@ async def _check_kubernetes_status(cluster: Cluster, service: Service):
             
             for pod in pods.items:
                 pod_status = pod.status.phase
-                print(f"\nPod: {pod.metadata.name}")
-                print(f"  Phase: {pod_status}")
+                logger.debug(f"\nPod: {pod.metadata.name}")
+                logger.debug(f"  Phase: {pod_status}")
                 
                 # Failed pod phase
                 if pod_status == "Failed":
-                    print(f"  -> Pod phase is Failed")
+                    logger.debug(f"  -> Pod phase is Failed")
                     has_crash_loop = True
                     continue
                 
                 # Check all container statuses
                 if pod.status.container_statuses:
                     for container in pod.status.container_statuses:
-                        print(f"  Container: {container.name}")
-                        print(f"    Restart count: {container.restart_count}")
-                        print(f"    Ready: {container.ready}")
+                        logger.debug(f"  Container: {container.name}")
+                        logger.debug(f"    Restart count: {container.restart_count}")
+                        logger.debug(f"    Ready: {container.ready}")
                         
                         # High restart count = crash loop
                         if container.restart_count > 2:
-                            print(f"    -> High restart count detected!")
+                            logger.debug(f"    -> High restart count detected!")
                             has_crash_loop = True
                         
                         # Check waiting state (current)
                         if container.state.waiting:
                             reason = container.state.waiting.reason or ""
                             message = container.state.waiting.message or ""
-                            print(f"    State: Waiting - Reason: {reason}")
-                            print(f"    Message: {message}")
+                            logger.debug(f"    State: Waiting - Reason: {reason}")
+                            logger.debug(f"    Message: {message}")
                             if "CrashLoopBackOff" in reason or "Error" in reason:
-                                print(f"    -> Crash/Error detected in waiting state!")
+                                logger.debug(f"    -> Crash/Error detected in waiting state!")
                                 has_crash_loop = True
                             elif "ImagePull" in reason:
-                                print(f"    -> Image pull error detected!")
+                                logger.debug(f"    -> Image pull error detected!")
                                 has_image_pull_error = True
                             elif reason in ["ContainerCreating", "PodInitializing"]:
                                 has_container_creating = True
                         
                         # Check running state
                         if container.state.running:
-                            print(f"    State: Running since {container.state.running.started_at}")
+                            logger.debug(f"    State: Running since {container.state.running.started_at}")
                             if not container.ready:
-                                print(f"    -> Running but not ready!")
+                                logger.debug(f"    -> Running but not ready!")
                                 has_not_ready = True
                         
                         # Check terminated state (current)
                         if container.state.terminated:
                             reason = container.state.terminated.reason or ""
                             exit_code = container.state.terminated.exit_code
-                            print(f"    State: Terminated - Reason: {reason}, Exit Code: {exit_code}")
+                            logger.debug(f"    State: Terminated - Reason: {reason}, Exit Code: {exit_code}")
                             if exit_code != 0:
-                                print(f"    -> Non-zero exit code detected!")
+                                logger.debug(f"    -> Non-zero exit code detected!")
                                 has_crash_loop = True
                         
                         # Check last_state for recent crashes
@@ -736,14 +1595,14 @@ async def _check_kubernetes_status(cluster: Cluster, service: Service):
                         if container.last_state and container.last_state.terminated:
                             reason = container.last_state.terminated.reason or ""
                             exit_code = container.last_state.terminated.exit_code
-                            print(f"    Last State: Terminated - Reason: {reason}, Exit Code: {exit_code}")
+                            logger.debug(f"    Last State: Terminated - Reason: {reason}, Exit Code: {exit_code}")
                             # Only mark as crash if the container is not currently running AND healthy
                             if not (container.state.running and container.ready):
                                 if reason in ["Error", "CrashLoopBackOff"]:
-                                    print(f"    -> Crash detected in last state!")
+                                    logger.debug(f"    -> Crash detected in last state!")
                                     has_crash_loop = True
                                 if exit_code != 0:
-                                    print(f"    -> Non-zero exit code in last state!")
+                                    logger.debug(f"    -> Non-zero exit code in last state!")
                                     has_crash_loop = True
                         
                         # If not ready for any reason
@@ -755,14 +1614,13 @@ async def _check_kubernetes_status(cluster: Cluster, service: Service):
                     has_pending = True
             
             # Determine final status based on collected information
-            print(f"\n=== Status Flags ===")
-            print(f"  has_crash_loop: {has_crash_loop}")
-            print(f"  has_image_pull_error: {has_image_pull_error}")
-            print(f"  has_container_creating: {has_container_creating}")
-            print(f"  has_pending: {has_pending}")
-            print(f"  has_not_ready: {has_not_ready}")
-            print(f"  available/desired replicas: {available_replicas}/{desired_replicas}")
-            print()
+            logger.debug(f"\n=== Status Flags ===")
+            logger.debug(f"  has_crash_loop: {has_crash_loop}")
+            logger.debug(f"  has_image_pull_error: {has_image_pull_error}")
+            logger.debug(f"  has_container_creating: {has_container_creating}")
+            logger.debug(f"  has_pending: {has_pending}")
+            logger.debug(f"  has_not_ready: {has_not_ready}")
+            logger.debug(f"  available/desired replicas: {available_replicas}/{desired_replicas}")
             
             # Determine final status based on collected information
             if has_crash_loop:
@@ -797,6 +1655,508 @@ async def _check_kubernetes_status(cluster: Cluster, service: Service):
                 "status": status,
                 "replicas": f"{available_replicas}/{desired_replicas}"
             }
-    finally:
-        if os.path.exists(temp_kubeconfig_path):
-            os.unlink(temp_kubeconfig_path)
+
+
+async def _update_service_internal_endpoints(cluster: Cluster, service: Service):
+    """Update service internal_host and internal_port from Kubernetes Service metadata."""
+    from src.utils.kubernetes import kube_config_context
+    
+    # First, try to get from Kubernetes Service object
+    try:
+        with kube_config_context(cluster):
+            core_v1 = client.CoreV1Api()
+            
+            # Get the Kubernetes Service
+            k8s_service = core_v1.read_namespaced_service(
+                name=service.name,
+                namespace=service.namespace
+            )
+            
+            # Get internal DNS name (ClusterIP service DNS)
+            service.internal_host = f"{service.name}.{service.namespace}.svc.cluster.local"
+            
+            # Get the first port from the service (typically the main port)
+            if k8s_service.spec.ports and len(k8s_service.spec.ports) > 0:
+                # Use the first port, or find by name if there's a specific one
+                service.internal_port = str(k8s_service.spec.ports[0].port)
+                logger.info(f"Updated {service.name} from K8s Service: {service.internal_host}:{service.internal_port}")
+                return True
+            else:
+                logger.warning(f"No ports found in K8s Service for {service.name}")
+                
+    except ApiException as e:
+        if e.status == 404:
+            logger.warning(f"K8s Service not found for {service.name}, trying pod inspection")
+        else:
+            logger.warning(f"Failed to read K8s Service for {service.name}: {e}")
+    except Exception as e:
+        logger.warning(f"Error reading K8s Service metadata for {service.name}: {e}")
+    
+    # Fallback: Inspect pods to find ports
+    try:
+        with kube_config_context(cluster):
+            core_v1 = client.CoreV1Api()
+            
+            # Get pods for this service
+            pods = core_v1.list_namespaced_pod(
+                namespace=service.namespace,
+                label_selector=f"app={service.name}"
+            )
+            
+            if pods.items and len(pods.items) > 0:
+                pod = pods.items[0]
+                
+                # Set internal host (standard K8s DNS)
+                service.internal_host = f"{service.name}.{service.namespace}.svc.cluster.local"
+                
+                # Get port from pod spec
+                if pod.spec.containers and len(pod.spec.containers) > 0:
+                    container = pod.spec.containers[0]
+                    if container.ports and len(container.ports) > 0:
+                        service.internal_port = str(container.ports[0].container_port)
+                        logger.info(f"Updated {service.name} from Pod spec: {service.internal_host}:{service.internal_port}")
+                        return True
+                        
+    except Exception as e:
+        logger.warning(f"Failed to get pod metadata for {service.name}: {e}")
+    
+    # No hardcoded fallback: require Kubernetes metadata; if missing, leave unset
+    logger.warning(f"Could not determine internal endpoint from Kubernetes for {service.name}")
+    return False
+
+
+async def _update_service_external_endpoint(cluster: Cluster, service: Service):
+    """Update service external_host and external_port from Kubernetes NodePort Service.
+    Tries in order:
+      1) A Service named "{service.name}-external" of type NodePort
+      2) The primary Service named "{service.name}" if it is of type NodePort
+    """
+    from src.utils.kubernetes import kube_config_context, get_node_ip
+    try:
+        with kube_config_context(cluster):
+            core_v1 = client.CoreV1Api()
+            node_ip = get_node_ip(cluster)
+            if not node_ip:
+                logger.debug("No node IP detected for external endpoint")
+                return False
+            # Try -external first
+            svc_candidates = [f"{service.name}-external", service.name]
+            ext_svc = None
+            for ext_name in svc_candidates:
+                try:
+                    candidate = core_v1.read_namespaced_service(name=ext_name, namespace=service.namespace)
+                    if candidate and candidate.spec and candidate.spec.type == "NodePort" and candidate.spec.ports:
+                        ext_svc = candidate
+                        break
+                except ApiException as e:
+                    if e.status == 404:
+                        continue
+                    raise
+            if not ext_svc:
+                logger.debug(f"No NodePort service found for {service.name} among {svc_candidates}")
+                return False
+            node_port = (
+                ext_svc.spec.ports[0].node_port if ext_svc.spec.ports and ext_svc.spec.ports[0].node_port else None
+            )
+            if not node_port:
+                logger.debug(f"NodePort missing on external Service {ext_name}")
+                return False
+            service.external_host = node_ip
+            service.external_port = str(node_port)
+            logger.info(
+                f"Updated external endpoint for {service.name}: {service.external_host}:{service.external_port}"
+            )
+            return True
+    except Exception as e:
+        logger.debug(f"Failed to update external endpoint for {service.name}: {e}")
+        return False
+
+
+async def _update_streamlink_deps_configmap(cluster: Cluster, db: AsyncSession):
+    """Update streamlink-deps ConfigMap with all service endpoints.
+    
+    Uses dynamic naming: {service}_internal_host and {service}_internal_port
+    where service is the manifest_name (e.g., kafka, schema-registry, postgres).
+    """
+    from src.utils.kubernetes import kube_config_context
+    
+    # Fetch all active services
+    stmt = select(Service).where(
+        Service.cluster_id == cluster.id,
+        Service.is_active == True
+    )
+    result = await db.execute(stmt)
+    services = result.scalars().all()
+
+    # Ensure each service has up-to-date endpoints before publishing
+    for svc in services:
+        try:
+            await _update_service_internal_endpoints(cluster, svc)
+            await _update_service_external_endpoint(cluster, svc)
+        except Exception:
+            # Non-blocking: continue even if a single service fails to update
+            logger.debug(f"Endpoint refresh failed for {svc.name}")
+    await db.commit()
+    
+    # Build ConfigMap data with dynamic naming
+    config_data = {}
+    
+    for svc in services:
+        # Use manifest_name as the key prefix (e.g., kafka, postgres, schema-registry)
+        service_key = svc.manifest_name or svc.name
+
+        # Internal endpoints
+        if svc.internal_host and svc.internal_port:
+            config_data[f"{service_key}_internal_host"] = svc.internal_host
+            config_data[f"{service_key}_internal_port"] = svc.internal_port
+            logger.debug(
+                f"Added to ConfigMap: {service_key}_internal_host={svc.internal_host}, {service_key}_internal_port={svc.internal_port}"
+            )
+
+        # External endpoints (NodePort + node IP), if available
+        if svc.external_host and svc.external_port:
+            config_data[f"{service_key}_external_host"] = svc.external_host
+            config_data[f"{service_key}_external_port"] = svc.external_port
+            logger.debug(
+                f"Added to ConfigMap: {service_key}_external_host={svc.external_host}, {service_key}_external_port={svc.external_port}"
+            )
+    
+    if not config_data:
+        logger.warning("No service endpoints available yet for ConfigMap")
+        # Create empty ConfigMap to avoid errors
+        config_data["placeholder"] = "waiting_for_services"
+    
+    # Create/update ConfigMap with merge to avoid wiping existing keys
+    try:
+        with kube_config_context(cluster):
+            core_v1 = client.CoreV1Api()
+            try:
+                existing_cm = core_v1.read_namespaced_config_map(name="streamlink-deps", namespace="streamlink")
+                existing_data = existing_cm.data or {}
+                existing_data.update(config_data)
+                existing_cm.data = existing_data
+                core_v1.replace_namespaced_config_map(name="streamlink-deps", namespace="streamlink", body=existing_cm)
+                logger.info(f"✓ Merged ConfigMap 'streamlink-deps' with {len(config_data)} new/updated entries")
+            except ApiException as e:
+                if e.status == 404:
+                    deps_config = client.V1ConfigMap(
+                        metadata=client.V1ObjectMeta(name="streamlink-deps", namespace="streamlink"),
+                        data=config_data
+                    )
+                    core_v1.create_namespaced_config_map(namespace="streamlink", body=deps_config)
+                    logger.info(f"✓ Created ConfigMap 'streamlink-deps' with {len(config_data)} entries")
+                else:
+                    raise
+    except Exception as e:
+        logger.error(f"Failed to update ConfigMap: {e}")
+        # Don't raise - this shouldn't block service deployment
+
+
+async def _create_kafbat_secret(cluster: Cluster, client_secret: str):
+    """Create Kubernetes secret for Kafbat UI Keycloak credentials."""
+    from src.utils.kubernetes import kube_config_context
+    
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+        
+        secret_name = "keycloak-secrets"
+        namespace = "streamlink"
+        
+        # Only store the client secret - client ID comes from ConfigMap
+        secret_data = {
+            "kafbat-client-secret": client_secret
+        }
+        
+        secret = client.V1Secret(
+            metadata=client.V1ObjectMeta(name=secret_name, namespace=namespace),
+            string_data=secret_data,
+            type="Opaque"
+        )
+        
+        try:
+            # Try to create the secret
+            core_v1.create_namespaced_secret(namespace=namespace, body=secret)
+            logger.info(f"Secret '{secret_name}' created in namespace '{namespace}'")
+        except ApiException as e:
+            if e.status == 409:
+                # Secret already exists, update it
+                core_v1.patch_namespaced_secret(name=secret_name, namespace=namespace, body=secret)
+                logger.info(f"Secret '{secret_name}' updated in namespace '{namespace}'")
+            else:
+                raise
+
+
+async def _delete_kafbat_secret(cluster: Cluster):
+    """Remove only Kafbat client key from shared 'keycloak-secrets' without deleting admin password."""
+    from src.utils.kubernetes import kube_config_context
+    
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+        secret_name = "keycloak-secrets"
+        namespace = "streamlink"
+
+        try:
+            existing: client.V1Secret = core_v1.read_namespaced_secret(name=secret_name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug(f"Secret '{secret_name}' not found; nothing to clean up")
+                return
+            raise
+
+        # existing.data values are base64-encoded; we just remove the key
+        data = existing.data or {}
+        if "kafbat-client-secret" in data:
+            data.pop("kafbat-client-secret", None)
+            existing.data = data
+            try:
+                core_v1.replace_namespaced_secret(name=secret_name, namespace=namespace, body=existing)
+                logger.info(f"Removed 'kafbat-client-secret' key from '{secret_name}' in namespace '{namespace}'")
+            except ApiException as e:
+                logger.error(f"Failed to update secret '{secret_name}': {e.status} {e.reason}")
+                raise
+        else:
+            logger.info("No 'kafbat-client-secret' key present; nothing to remove")
+
+
+async def _ensure_global_config(cluster, namespace: str = "streamlink"):
+    """Create/update global ConfigMap automatically from settings object.
+    
+    Reads all non-secret fields from settings and creates a Kubernetes ConfigMap.
+    Secret fields (marked with json_schema_extra={'secret': True}) are excluded.
+    """
+    from src.utils.kubernetes import kube_config_context
+    
+    logger.info(f"Creating global ConfigMap for namespace: {namespace}")
+    
+    with kube_config_context(cluster):
+        
+        # Ensure namespace exists first
+        core_v1 = client.CoreV1Api()
+        try:
+            core_v1.read_namespace(namespace)
+        except ApiException as e:
+            if e.status == 404:
+                # Create namespace if it doesn't exist
+                namespace_manifest = client.V1Namespace(
+                    metadata=client.V1ObjectMeta(name=namespace)
+                )
+                core_v1.create_namespace(namespace_manifest)
+                logger.info(f"✓ Created namespace '{namespace}'")
+            else:
+                raise
+        
+        # Auto-generate config data from settings object
+        config_data = {}
+        
+        logger.debug(f"Processing {len(settings.model_fields)} fields from settings")
+        
+        # Iterate through all Pydantic fields
+        for field_name, field_info in settings.model_fields.items():
+            # Skip fields marked as secret
+            if field_info.json_schema_extra and field_info.json_schema_extra.get('secret'):
+                continue
+            
+            # Get the value from settings
+            value = getattr(settings, field_name)
+            
+            # Skip None values
+            if value is None:
+                continue
+            
+            # Convert field name to kebab-case for Kubernetes
+            k8s_key = field_name.lower().replace('_', '-')
+            
+            # Convert value to string (ConfigMaps only store strings)
+            if isinstance(value, bool):
+                config_data[k8s_key] = "true" if value else "false"
+            elif isinstance(value, (list, dict)):
+                import json
+                config_data[k8s_key] = json.dumps(value)
+            else:
+                config_data[k8s_key] = str(value)
+        
+        logger.debug(f"Total config values to store: {len(config_data)}")
+        logger.debug(f"Sample keys: {list(config_data.keys())[:5]}")
+        
+        # Create ConfigMap manifest
+        config_map = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "streamlink-config",
+                "namespace": namespace
+            },
+            "data": config_data
+        }
+        
+        # Apply to Kubernetes
+        core_v1 = client.CoreV1Api()
+        try:
+            logger.info(f"Attempting to create ConfigMap in namespace '{namespace}'")
+            core_v1.create_namespaced_config_map(namespace, config_map)
+            logger.info(f"✅ Created ConfigMap 'streamlink-config' with {len(config_data)} config values")
+        except ApiException as e:
+            if e.status == 409:  # Already exists, update it
+                logger.info("ConfigMap exists, updating...")
+                core_v1.replace_namespaced_config_map("streamlink-config", namespace, config_map)
+                logger.info(f"✅ Updated ConfigMap 'streamlink-config' with {len(config_data)} config values")
+            else:
+                logger.error(f"❌ Failed to create/update ConfigMap: {e.status} - {e.reason}")
+                raise
+
+
+async def _get_cluster_node_ip(cluster: Cluster) -> Optional[str]:
+    """Discover a reachable node IP for external NodePort access.
+    Prefer ExternalIP if present; otherwise use InternalIP.
+    """
+    from src.utils.kubernetes import kube_config_context
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+        try:
+            nodes = core_v1.list_node().items
+            for addr_type in ("ExternalIP", "InternalIP"):
+                for node in nodes:
+                    addrs = node.status.addresses or []
+                    for a in addrs:
+                        if a.type == addr_type and a.address:
+                            return a.address
+        except ApiException as e:
+            logger.warning(f"Failed to list cluster nodes: {e.status} {e.reason}")
+        return None
+
+
+async def _patch_streamlink_config(cluster: Cluster, updates: dict, namespace: str = "streamlink"):
+    """Merge simple string key updates into the streamlink-config ConfigMap."""
+    from src.utils.kubernetes import kube_config_context
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+        try:
+            cm = core_v1.read_namespaced_config_map(name="streamlink-config", namespace=namespace)
+            data = cm.data or {}
+            data.update({k: str(v) for k, v in updates.items() if v is not None})
+            cm.data = data
+            core_v1.replace_namespaced_config_map(name="streamlink-config", namespace=namespace, body=cm)
+        except ApiException as e:
+            if e.status == 404:
+                # Create new configmap if missing
+                cm_body = client.V1ConfigMap(metadata=client.V1ObjectMeta(name="streamlink-config", namespace=namespace), data={k: str(v) for k, v in updates.items() if v is not None})
+                core_v1.create_namespaced_config_map(namespace=namespace, body=cm_body)
+            else:
+                raise
+
+# Removed: No need to patch streamlink-deps with Kafbat redirect/logout URIs.
+
+
+async def _ensure_dependency_config(cluster: Cluster, db: AsyncSession, namespace: str = "streamlink"):
+    """Publish dependency information (internal hosts/ports) and ensure required secrets.
+
+    Currently supports Postgres. Creates/updates ConfigMap 'streamlink-deps' with:
+    - postgres-host, postgres-port
+    - keycloak-db-username (for consumers)
+    - keycloak-db-url (computed JDBC URL for Keycloak)
+
+    Also ensures 'postgres-secret' exists, creating from DB if missing.
+    """
+    from src.utils.kubernetes import kube_config_context
+
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+
+        # Ensure namespace exists
+        try:
+            core_v1.read_namespace(namespace)
+        except ApiException as e:
+            if e.status == 404:
+                ns = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
+                core_v1.create_namespace(ns)
+                logger.info(f"✓ Created namespace '{namespace}' for dependency config")
+            else:
+                raise
+
+        # Ensure postgres-secret exists. If missing, recreate from Service record.
+        need_pg_secret = False
+        try:
+            core_v1.read_namespaced_secret("postgres-secret", namespace)
+        except ApiException as e:
+            if e.status == 404:
+                need_pg_secret = True
+            else:
+                raise
+
+        if need_pg_secret:
+            logger.info("postgres-secret not found. Attempting to recreate from DB service record...")
+            stmt = select(Service).where(Service.cluster_id == cluster.id, Service.manifest_name == "postgres", Service.is_active == True)
+            res = await db.execute(stmt)
+            pg_service = res.scalar_one_or_none()
+            if pg_service and pg_service.password:
+                crypto = get_crypto_service()
+                try:
+                    pg_pwd = crypto.decrypt(pg_service.password)
+                except Exception:
+                    pg_pwd = ""
+                if pg_pwd:
+                    secret = client.V1Secret(
+                        metadata=client.V1ObjectMeta(name="postgres-secret", namespace=namespace),
+                        string_data={"postgres-password": pg_pwd}
+                    )
+                    try:
+                        core_v1.create_namespaced_secret(namespace, secret)
+                        logger.info("✓ Recreated 'postgres-secret' from DB")
+                    except ApiException as e:
+                        if e.status == 409:
+                            core_v1.patch_namespaced_secret("postgres-secret", namespace, secret)
+                            logger.info("✓ Updated 'postgres-secret' from DB")
+                        else:
+                            raise
+            else:
+                logger.warning("Cannot recreate 'postgres-secret': missing service record or password")
+
+        # Publish internal host/port via ConfigMap (no hardcoded defaults)
+        postgres_host = None
+        postgres_port = None
+        stmt = select(Service).where(Service.cluster_id == cluster.id, Service.manifest_name == "postgres", Service.is_active == True)
+        res = await db.execute(stmt)
+        pg_service = res.scalar_one_or_none()
+        if pg_service:
+            postgres_host = pg_service.internal_host or pg_service.name
+            postgres_port = pg_service.internal_port
+            if not postgres_port:
+                try:
+                    svc_obj = core_v1.read_namespaced_service(name=pg_service.name, namespace=namespace)
+                    if svc_obj.spec.ports and len(svc_obj.spec.ports) > 0:
+                        postgres_port = str(svc_obj.spec.ports[0].port)
+                except ApiException:
+                    pass
+
+        if not postgres_host or not postgres_port:
+            logger.warning("Postgres endpoints not available; skipping dependency ConfigMap update")
+            return
+
+        # Merge-only update to avoid wiping other keys and adhere to naming standard
+        try:
+            existing_cm = core_v1.read_namespaced_config_map(name="streamlink-deps", namespace=namespace)
+            data = existing_cm.data or {}
+            data.update({
+                "postgres_internal_host": postgres_host,
+                "postgres_internal_port": postgres_port,
+                "keycloak_db_username": "keycloak",
+                "keycloak_db_url": f"jdbc:postgresql://{postgres_host}:{postgres_port}/keycloak"
+            })
+            existing_cm.data = data
+            core_v1.replace_namespaced_config_map(name="streamlink-deps", namespace=namespace, body=existing_cm)
+            logger.info("✓ Merged Postgres keys into ConfigMap 'streamlink-deps' for init")
+        except ApiException as e:
+            if e.status == 404:
+                cm = client.V1ConfigMap(
+                    metadata=client.V1ObjectMeta(name="streamlink-deps", namespace=namespace),
+                    data={
+                        "postgres_internal_host": postgres_host,
+                        "postgres_internal_port": postgres_port,
+                        "keycloak_db_username": "keycloak",
+                        "keycloak_db_url": f"jdbc:postgresql://{postgres_host}:{postgres_port}/keycloak"
+                    }
+                )
+                core_v1.create_namespaced_config_map(namespace=namespace, body=cm)
+                logger.info("✓ Created ConfigMap 'streamlink-deps' with Postgres keys for init")
+            else:
+                raise

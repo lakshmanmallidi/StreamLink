@@ -2,16 +2,16 @@
 
 > **⚠️ IN PROGRESS**: This project is under active development. Features and documentation may change frequently.
 
-A unified open-source tool for end-to-end event orchestration and Kubernetes service management. StreamLink provides a single control plane for managing Kafka, Schema Registry, and other event streaming infrastructure with integrated authentication, encryption, and monitoring.
+A unified open-source tool for end-to-end event orchestration and Kubernetes service management. StreamLink provides a single control plane for managing Kafka, Schema Registry, PostgreSQL, Keycloak, and other services with integrated authentication, encryption, and dependency-aware deployment.
 
 ## Features
 
 - 🔐 **OAuth2 Authentication** - Keycloak integration with PKCE flow
-- ☸️ **Kubernetes Management** - Single-cluster connection with encrypted kubeconfig storage
-- 🚀 **Service Deployment** - One-click deployment of Kafka and Schema Registry to Kubernetes
+- ☸️ **Kubernetes Management** - Multi-cluster support with encrypted kubeconfig storage
+- 🚀 **Service Deployment** - One-click deployment of services with automatic dependency resolution
 - 📊 **Health Monitoring** - Real-time service status and pod health tracking
-- 🔒 **Security First** - Fernet encryption for sensitive data, secrets isolated from configuration
-- 💻 **Modern UI** - React-based dashboard with collapsible sidebar and auto-refresh
+- 🔒 **Security First** - Fernet encryption for sensitive data, auto-generated passwords
+- 💻 **Modern UI** - React-based dashboard with service management
 
 ## Tech Stack
 
@@ -25,21 +25,59 @@ A unified open-source tool for end-to-end event orchestration and Kubernetes ser
 - React 18.2.0 + React Router 6.20.0
 - Parcel 2.10.3 (bundler)
 
-**Infrastructure**:
+**Services** (deployed via Kubernetes):
 - PostgreSQL 15 (application database)
 - Keycloak 23 (identity provider)
-- Docker Compose (local development)
+- Apache Kafka (event streaming)
+- Schema Registry (schema management)
+- Kafka Connect, ksqlDB, Kafbat UI
 
 ---
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+      U[User Browser] --> FE[StreamLink Frontend]
+      FE --> BE[StreamLink Backend (FastAPI)]
+      BE --> DB[(PostgreSQL)]
+      BE --> K8s[Kubernetes API]
+
+      subgraph Kubernetes Cluster
+         KC[Keycloak]
+         KF[Kafka]
+         SR[Schema Registry]
+         CON[Kafka Connect]
+         KSQL[ksqlDB]
+         KUI[Kafbat UI]
+      end
+
+      K8s --> KC
+      K8s --> KF
+      KF --> SR
+      KF --> CON
+      KF --> KSQL
+
+      KUI --> KC
+      KUI --> SR
+      KUI --> CON
+      KUI --> KSQL
+```
+
+### Automatic Service Wiring
+- **Dependency-aware deployments**: Each service discovers existing endpoints via ConfigMaps and environment expansion.
+- **Keycloak issuer**: Kafbat UI reads Keycloak external host/port and computes its issuer URL automatically.
+- **Kafka integrations**: Schema Registry, Kafka Connect, and ksqlDB auto-bind to Kafka using published cluster endpoints.
+- **Zero manual glue**: As you add deployments, they connect to what’s already running—no extra configuration needed.
 
 # Development Guide
 
 ## Prerequisites
 
-- **Docker & Docker Compose** - For PostgreSQL and Keycloak
+- **Kubernetes Cluster** - For deploying services
 - **Python 3.11+** - Backend runtime
 - **Node.js 18+** - Frontend runtime
-- **kubectl** - (Optional) For Kubernetes cluster management
+- **kubectl** - Kubernetes CLI tool
 
 ## Quick Start
 
@@ -52,120 +90,59 @@ cd StreamLink
 
 ### 2. Setup Environment Variables
 
-Copy the template and configure your secrets:
+Create `.env` with only one variable: `ENCRYPTION_KEY`.
 
 ```bash
-cp .env.example .env
-```
-
-Edit `.env` and set the following secrets:
-
-```bash
-# PostgreSQL Passwords
-POSTGRES_PASSWORD=streamlink123
-KC_DB_PASSWORD=keycloak123
-
-# Keycloak Admin Password
-KEYCLOAK_ADMIN_PASSWORD=admin123
-
-# OAuth2 Client Secret (will get from Keycloak setup below)
-KEYCLOAK_CLIENT_SECRET=<placeholder-for-now>
-
-# Generate Encryption Key
-# Run: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-ENCRYPTION_KEY=<generated-key-here>
-```
-
-**Generate Encryption Key**:
-```bash
+# Generate a key, then paste it into .env
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+echo "ENCRYPTION_KEY=<paste-generated-key-here>" > .env
 ```
 
-Copy the output and paste it as `ENCRYPTION_KEY` in `.env`.
+All other service configuration is handled internally by StreamLink and stored in `backend/src/config.py`. You do not need to edit it.
 
-### 3. Start Infrastructure (PostgreSQL + Keycloak)
+### 3. Deploy Services to Kubernetes
+
+StreamLink deploys all services (PostgreSQL, Keycloak, Kafka, etc.) to your Kubernetes cluster through the UI.
+
+1. Start the backend and frontend (see next section)
+2. Add your Kubernetes cluster via the UI
+3. Deploy services in order:
+   - PostgreSQL (database)
+   - Keycloak (authentication)
+   - Kafka → Schema Registry → Kafka Connect → ksqlDB → Kafbat UI
+
+The system auto-generates passwords and handles dependencies automatically.
+
+### 4. Post-Deployment: Create a Keycloak User (Manual)
+
+> StreamLink initializes the `streamlink` realm and required clients automatically. You only need to create a login user.
+
+1) Retrieve the Keycloak admin password from Kubernetes:
 
 ```bash
-docker-compose up -d
+kubectl -n streamlink get secret keycloak-secrets \
+   -o jsonpath='{.data.admin-password}' | base64 --decode; echo
 ```
 
-This will start:
-- **PostgreSQL** on port `5432` (database for StreamLink and Keycloak)
-- **Keycloak** on port `8080` (identity provider)
+Admin username: `admin`
 
-Wait for services to be healthy:
+2) Access the Keycloak Admin Console:
+- Option A (NodePort): `http://<node-ip>:30081/admin`
+   - Find node IP: `kubectl get nodes -o wide`
+- Option B (local port-forward):
+
 ```bash
-docker-compose ps
-# Both should show "healthy" status
+kubectl -n streamlink port-forward svc/keycloak 8080:8080
+# Then open http://localhost:8080/admin
 ```
 
-Check logs if needed:
-```bash
-docker-compose logs -f postgres
-docker-compose logs -f keycloak
-```
+3) Create a user in the `streamlink` realm:
+- Top-left realm selector → choose `streamlink`
+- Users → Add user → set `username`
+- Credentials → Set password → disable `Temporary` → Save
 
-### 4. Configure Keycloak
-
-Keycloak needs one-time setup to create the realm, client, and test user.
-
-#### 4.1 Access Keycloak Admin Console
-
-Open http://localhost:8080/admin in your browser.
-
-**Login**:
-- Username: `admin`
-- Password: `admin123` (from your `.env` file)
-
-#### 4.2 Create StreamLink Realm
-
-> **Why?** The `master` realm is for Keycloak administration only. Your application needs its own realm.
-
-1. Click the **"Master"** dropdown in the top-left corner
-2. Click **"Create realm"**
-3. **Realm name**: `streamlink`
-4. Click **"Create"**
-
-You should now see "streamlink" in the top-left (not "Master").
-
-#### 4.3 Create OAuth2 Client
-
-1. In the left sidebar, click **"Clients"**
-2. Click **"Create client"** button
-3. **Client ID**: `streamlink-api`
-4. Click **"Next"**
-5. **Client authentication**: Turn **ON**
-6. Click **"Next"**
-7. **Valid redirect URIs**: `http://localhost:3001/auth/callback`
-8. Click **"Save"**
-
-#### 4.4 Get Client Secret
-
-1. Go to the **"Credentials"** tab
-2. Copy the **"Client secret"** value
-3. Update your `.env` file:
-   ```bash
-   KEYCLOAK_CLIENT_SECRET=<paste-the-secret-here>
-   ```
-
-#### 4.5 Create Test User
-
-1. In the left sidebar, click **"Users"**
-2. Click **"Create new user"** button
-3. Fill in:
-   - **Username**: `testuser`
-   - **Email**: `test@example.com`
-   - **First name**: `Test`
-   - **Last name**: `User`
-4. Click **"Create"**
-5. Go to the **"Credentials"** tab
-6. Click **"Set password"**
-7. Enter password: `password123`
-8. **Temporary**: Turn **OFF** (important!)
-9. Click **"Save"**
-10. Confirm by clicking **"Save password"**
-
-### 5. Run Backend
+You can now log in to StreamLink with this user.
+### 4. Run Backend
 
 ```bash
 cd backend
@@ -207,12 +184,10 @@ This script will:
 1. Open http://localhost:3001 in your browser
 2. Click **"Login"** button
 3. You'll be redirected to Keycloak
-4. Login with:
-   - Username: `testuser`
-   - Password: `password123`
+4. Log in with the user you created in the `streamlink` realm
 5. After successful login, you'll be redirected to the dashboard
 6. You should see:
-   - User info in the sidebar (testuser)
+   - User info in the sidebar
    - Dashboard home page
    - Kubernetes menu (if you add a cluster)
    - Services menu (after cluster is connected)
@@ -227,43 +202,20 @@ StreamLink separates **secrets** from **configuration** for security:
 
 | File | Purpose | In Git? |
 |------|---------|---------|
-| `.env` | **Secrets only** (passwords, keys) | ❌ No (gitignored) |
-| `.env.example` | Template with placeholders | ✅ Yes |
-| `backend/src/config.py` | Backend configuration | ✅ Yes |
-| `docker-compose.yml` | Infrastructure config | ✅ Yes |
+| `.env` | Encryption key only (`ENCRYPTION_KEY`) | ❌ No (gitignored) |
+| `backend/src/config.py` | Internal application/service configuration | ✅ Yes |
+| `backend/deployments/*.yaml` | Kubernetes manifests | ✅ Yes |
 
 ### What Goes Where?
 
-**`.env` - Secrets Only** (5 variables):
+**`.env`**:
 ```bash
-POSTGRES_PASSWORD           # PostgreSQL password
-KC_DB_PASSWORD             # Keycloak database password
-KEYCLOAK_ADMIN_PASSWORD    # Keycloak admin password
-KEYCLOAK_CLIENT_SECRET     # OAuth2 client secret (from Keycloak)
-ENCRYPTION_KEY             # Fernet encryption key
+ENCRYPTION_KEY=<generated-key>
 ```
 
-**`backend/src/config.py` - Application Settings**:
-- Database host, port, name, username
-- Keycloak URL, realm, client ID, redirect URI
-- JWT algorithm, token expiry times
-- CORS origins, debug mode, log level
-
-**`docker-compose.yml` - Infrastructure**:
-- Service definitions (postgres, keycloak)
-- Image versions, port mappings
-- Volume mounts, health checks
-- Database names, usernames (non-sensitive)
-
-### Priority Order
-
-When the same variable is defined multiple times:
-
-1. **Shell environment** (highest priority)
-2. **`.env` file**
-3. **`config.py` defaults** (lowest priority)
-
-**Example**: Set `DEBUG=False` in `.env` to override the `DEBUG=True` default in `config.py`.
+**`backend/src/config.py`**:
+- Contains all other configuration (service defaults, OAuth, issuer URIs, etc.)
+- Managed by StreamLink; no manual edits required
 
 ---
 
@@ -273,16 +225,19 @@ When the same variable is defined multiple times:
 StreamLink/
 ├── .env                       # Secrets (gitignored)
 ├── .env.example              # Template
-├── docker-compose.yml        # PostgreSQL + Keycloak
 ├── README.md                 # This file
 │
 ├── backend/
 │   ├── dev.sh               # Backend development script
 │   ├── requirements.txt     # Python dependencies
-│   ├── alembic/             # Database migrations
 │   ├── deployments/         # Kubernetes YAML manifests
+│   │   ├── postgres.yaml
+│   │   ├── keycloak.yaml
 │   │   ├── kafka.yaml
-│   │   └── schema-registry.yaml
+│   │   ├── schema-registry.yaml
+│   │   ├── kafka-connect.yaml
+│   │   ├── ksqldb.yaml
+│   │   └── kafbat-ui.yaml
 │   └── src/
 │       ├── main.py          # FastAPI application
 │       ├── config.py        # Configuration
@@ -305,14 +260,17 @@ StreamLink/
 │   └── src/
 │       ├── App.jsx          # React router
 │       ├── pages/
-│       │   ├── Login.jsx
+│       │   ├── LoginSimple.jsx
 │       │   ├── DashboardSimple.jsx
-│       │   ├── Kubernetes.jsx
+│       │   ├── Clusters.jsx
 │       │   └── Services.jsx
 │       └── components/      # Reusable components
 │
-└── scripts/
-    └── init-db.sh           # Database initialization
+└── deployments/             # Kubernetes manifests
+    ├── postgres.yaml        # PostgreSQL StatefulSet
+    ├── keycloak.yaml        # Keycloak Deployment
+    ├── kafka.yaml           # Kafka broker
+    └── ...                  # Other service manifests
 ```
 
 ---
@@ -322,10 +280,7 @@ StreamLink/
 ### Starting Development
 
 ```bash
-# Terminal 1: Infrastructure
-docker-compose up -d
-
-# Terminal 2: Backend
+# Terminal 1: Backend
 cd backend && bash dev.sh
 
 # Terminal 3: Frontend
@@ -359,11 +314,8 @@ alembic upgrade head
 
 # Stop frontend: Ctrl+C in frontend terminal
 
-# Stop infrastructure
-docker-compose down
-
-# Stop and remove volumes (clean slate)
-docker-compose down -v
+# Clean up Kubernetes resources (if needed)
+kubectl delete namespace streamlink
 ```
 
 ---
@@ -387,9 +339,14 @@ The kubeconfig is encrypted with Fernet before storing in the database.
 
 1. Ensure a cluster is connected
 2. Go to **"Services"** page
-3. Click **"Deploy"** on Kafka or Schema Registry
-4. Service status updates every 5 seconds
-5. Watch for status to change: deploying → running
+3. Deploy services in dependency order:
+   - PostgreSQL (database for StreamLink)
+   - Keycloak (authentication, depends on PostgreSQL)
+   - Kafka (event streaming)
+   - Schema Registry (depends on Kafka)
+   - Other services as needed
+4. Passwords are auto-generated and logged to backend console
+5. Service status updates in real-time
 
 ### Check Logs
 
@@ -397,27 +354,20 @@ The kubeconfig is encrypted with Fernet before storing in the database.
 
 **Frontend Logs**: Check browser console (F12 → Console)
 
-**Database Logs**:
+**Kubernetes Pod Logs**:
 ```bash
-docker-compose logs -f postgres
-```
-
-**Keycloak Logs**:
-```bash
-docker-compose logs -f keycloak
-```
-
-**Docker Container Logs**:
-```bash
-docker-compose logs -f
+kubectl logs -n streamlink <pod-name>
+kubectl logs -n streamlink -l app=postgres
+kubectl logs -n streamlink -l app=keycloak
 ```
 
 ### Database Access
 
-**Connect to PostgreSQL**:
+**Connect to PostgreSQL** (once deployed to Kubernetes):
 ```bash
+kubectl port-forward -n streamlink svc/postgres 5432:5432
 psql -h localhost -U streamlink -d streamlink
-# Password from .env (POSTGRES_PASSWORD)
+# Use the generated password from deployment logs
 ```
 
 **Useful Queries**:
@@ -439,11 +389,6 @@ If you're stuck with wrong user or session issues:
 ```bash
 # Clear browser data
 # Press F12 → Application → Storage → Clear site data
-
-# Or restart Keycloak
-docker-compose restart keycloak
-```
-
 ---
 
 ## Troubleshooting
@@ -457,11 +402,10 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 ```
 
 **Error: "Connection refused" (PostgreSQL)**
-```bash
-docker-compose ps          # Check postgres is running
-docker-compose up -d       # Start if not running
-docker-compose logs postgres  # Check logs
-```
+- PostgreSQL must be deployed to Kubernetes first
+- Check pod status: `kubectl get pods -n streamlink`
+- Check logs: `kubectl logs -n streamlink -l app=postgres`
+- Port forward to test: `kubectl port-forward -n streamlink svc/postgres 5432:5432`
 
 **Error: "Module not found"**
 ```bash
@@ -489,20 +433,18 @@ npm install
 
 ### Keycloak issues
 
-**Can't access admin console**
-- Verify Keycloak is running: `docker-compose ps`
-- Check logs: `docker-compose logs keycloak`
-- Wait for "Keycloak started" message
+**Can't access Keycloak**
+- Check pod status: `kubectl get pods -n streamlink -l app=keycloak`
+- Check logs: `kubectl logs -n streamlink -l app=keycloak`
+- Port forward to access: `kubectl port-forward -n streamlink svc/keycloak 8080:8080`
+- Access admin console: http://localhost:8080/admin
+- Use auto-generated admin password from deployment logs
 
 **"Invalid client credentials"**
-- Verify `KEYCLOAK_CLIENT_SECRET` in `.env` matches Keycloak credentials tab
-- Ensure you're in the `streamlink` realm (not master)
-- Restart backend after updating `.env`
-
-**Stuck logging in as admin**
-- Clear browser cookies and localStorage (F12 → Application → Storage)
-- Ensure test user was created in the `streamlink` realm
-- Verify test user password is set and not temporary
+- Redeploy Keycloak to regenerate client secret
+- Check backend logs for the generated credentials
+- Update `.env` with new credentials
+- Restart backend
 
 ### Kubernetes connection fails
 
@@ -585,16 +527,16 @@ See [LICENSE](LICENSE) file for details.
 For issues or questions:
 1. Check this README and troubleshooting section
 2. Check application logs (backend terminal, browser console)
-3. Check Docker logs: `docker-compose logs`
+3. Check Kubernetes pod logs: `kubectl logs -n streamlink <pod-name>`
 
 ---
 
 ## What's Next?
 
 Current development priorities:
-- [ ] Database migration for services table
-- [ ] Service credentials storage
-- [ ] Multi-service configuration UI
-- [ ] Enhanced monitoring and alerting
-- [ ] Cluster edit functionality
+- [ ] UI bug fixes and polish
+- [ ] End-to-end integration testing across services
+- [ ] Multi-cluster services for scale
+- [ ] Monitoring of all pods per deployment
+- [ ] Configurable resources (CPU/memory) during service deploy
 - [ ] Role-based access control (RBAC)

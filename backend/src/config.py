@@ -1,5 +1,6 @@
 """Application configuration."""
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import List, Optional
 import os
 
@@ -16,55 +17,38 @@ class Settings(BaseSettings):
     # App Configuration
     APP_NAME: str = "StreamLink"
     APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True  # Default to True for development
-    LOG_LEVEL: str = "info"
 
-    # Database Configuration
-    # Non-sensitive parts are here, password comes from env var
-    DB_HOST: str = "localhost"
-    DB_PORT: int = 5433
-    DB_NAME: str = "streamlink"
-    DB_USER: str = "streamlink"
-    DB_PASSWORD: str = ""  # MUST be set via POSTGRES_PASSWORD env var
-    
-    @property
-    def DATABASE_URL(self) -> str:
-        """Construct database URL from components."""
-        password = os.getenv("POSTGRES_PASSWORD", self.DB_PASSWORD)
-        return f"postgresql+asyncpg://{self.DB_USER}:{password}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+    # External NodePort Configuration (for services exposed outside Kubernetes)
+    POSTGRES_NODEPORT: int = 30432
+    KEYCLOAK_NODEPORT: int = 30081
+    KAFBAT_UI_NODEPORT: int = 30080
 
-    # Keycloak Configuration (non-sensitive)
-    KEYCLOAK_URL: str = "http://localhost:8080"
-    KEYCLOAK_REALM: str = "streamlink"
-    KEYCLOAK_CLIENT_ID: str = "streamlink-api"
-    KEYCLOAK_CLIENT_SECRET: str = ""  # MUST be set via env var
-    KEYCLOAK_REDIRECT_URI: str = "http://localhost:3001/auth/callback"
-
-    # JWT Configuration
-    JWT_ALGORITHM: str = "RS256"
-    JWT_ACCESS_TOKEN_EXPIRY: int = 900  # 15 minutes
-    JWT_REFRESH_TOKEN_EXPIRY: int = 604800  # 7 days
-
-    # CORS Configuration
+    # CORS Configuration (exact origins with protocol)
     CORS_ORIGINS: List[str] = [
         "http://localhost:3001",
         "http://localhost:3000",
-        "https://streamlink.example.com",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3000",
     ]
     ALLOWED_HOSTS: List[str] = ["*"]
-
-    # Kubernetes Configuration
-    KUBECONFIG_PATH: str = "~/.kube/config"
-
-    # Kafka Configuration (OPTIONAL - User configures via UI)
-    KAFKA_BOOTSTRAP_SERVERS: Optional[str] = None
-    KAFKA_SECURITY_PROTOCOL: str = "PLAINTEXT"
-
-    # Logging Configuration
-    STRUCTLOG_JSON_LOGS: bool = True
     
     # Encryption (Secret - MUST be set via env var)
-    ENCRYPTION_KEY: str = ""  # MUST be set via env var
+    ENCRYPTION_KEY: str = Field(default="", json_schema_extra={'secret': True})  # MUST be set via env var
+    
+    # Keycloak OAuth Client Configuration (for StreamLink API)
+    KEYCLOAK_STREAMLINK_API_CLIENT_ID: str = "streamlink-api"
+    KEYCLOAK_STREAMLINK_API_REDIRECT_URI: str = "http://localhost:3001/auth/callback"
+    KEYCLOAK_STREAMLINK_API_POST_LOGOUT_URI: str = "http://localhost:3001/login"
+    
+    # Keycloak OAuth Client Configuration (for Kafbat UI)
+    KEYCLOAK_KAFBAT_UI_CLIENT_ID: str = "kafbat-ui"
+
+    # Keycloak Issuer URI (for OIDC discovery used by Kafbat UI)
+    # Use internal service URL so in-cluster apps can reach it
+    KEYCLOAK_ISSUER_URI: str = "http://keycloak.streamlink.svc.cluster.local:8080/realms/streamlink"
+
+    # External URLs for Kafbat UI will be computed from cluster node IPs
+    # during deployment, not from static app settings.
 
     class Config:
         env_file = ".env"

@@ -6,21 +6,27 @@ from collections import defaultdict, deque
 # Service dependency graph
 # Key: service name, Value: list of dependencies
 SERVICE_DEPENDENCIES: Dict[str, List[str]] = {
+    "postgres": [],  # No dependencies
+    "keycloak": ["postgres"],  # Depends on Postgres
     "kafka": [],  # No dependencies
     "schema-registry": ["kafka"],  # Depends on Kafka
     "kafka-connect": ["kafka", "schema-registry"],  # Depends on both
-    "ksqldb": ["kafka"],  # Depends on Kafka
+    "ksqldb": ["kafka", "schema-registry", "kafka-connect"],  # Depends on Kafka, Schema Registry, and Kafka Connect
     "kafka-rest": ["kafka", "schema-registry"],  # Depends on both
+    "kafbat-ui": ["kafka", "schema-registry", "kafka-connect", "ksqldb", "keycloak"],  # UI depends on all services
 }
 
 
 # Service display names
 SERVICE_DISPLAY_NAMES: Dict[str, str] = {
+    "postgres": "PostgreSQL Database",
+    "keycloak": "Keycloak (Authentication)",
     "kafka": "Apache Kafka",
     "schema-registry": "Schema Registry",
     "kafka-connect": "Kafka Connect",
     "ksqldb": "ksqlDB",
     "kafka-rest": "Kafka REST Proxy",
+    "kafbat-ui": "Kafbat UI",
 }
 
 

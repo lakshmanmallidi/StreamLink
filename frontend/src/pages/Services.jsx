@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { apiFetch } from "../apiClient";
 
 export default function Services() {
   const [services, setServices] = useState([]);
@@ -10,16 +11,26 @@ export default function Services() {
   const [showPlanModal, setShowPlanModal] = useState(false);
   const [deletePlan, setDeletePlan] = useState(null);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [bootstrapStatus, setBootstrapStatus] = useState(null);
+  const [migrating, setMigrating] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
     fetchCluster();
     fetchServices();
+    fetchBootstrapStatus();
   }, []);
 
-  // Auto-refresh service status every 5 seconds
+  // Auto-refresh service status every 5 seconds (only while deploying)
   useEffect(() => {
     if (services.length === 0) return;
+    
+    // Only poll if there are services that are deploying, starting, or stopping
+    const hasActiveServices = services.some(s => 
+      s.status === "deploying" || s.status === "starting" || s.status === "stopping"
+    );
+    
+    if (!hasActiveServices) return;
 
     const interval = setInterval(() => {
       // Check status for each service in Kubernetes
@@ -29,13 +40,27 @@ export default function Services() {
     return () => clearInterval(interval);
   }, [services]);
 
+  // Poll bootstrap status every 5 seconds when postgres is deployed but migration not complete
+  useEffect(() => {
+    if (!bootstrapStatus) return;
+    
+    // Only poll if postgres is deployed but migration not ready/complete
+    if (bootstrapStatus.postgres_deployed && !bootstrapStatus.migration_complete) {
+      const interval = setInterval(async () => {
+        const status = await fetchBootstrapStatus();
+        // Stop polling immediately if migration completes
+        if (status && status.migration_complete) {
+          clearInterval(interval);
+        }
+      }, 5000);
+
+      return () => clearInterval(interval);
+    }
+  }, [bootstrapStatus]);
+
   const checkServiceStatus = async (serviceId) => {
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/services/${serviceId}/check-status`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await apiFetch(`/v1/services/${serviceId}/check-status`, { method: "POST" });
       // Refresh the list after checking
       await fetchServices();
     } catch (err) {
@@ -45,10 +70,7 @@ export default function Services() {
 
   const fetchCluster = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/clusters`);
       const data = await response.json();
       setCluster(data.length > 0 ? data[0] : null);
     } catch (err) {
@@ -58,16 +80,51 @@ export default function Services() {
 
   const fetchServices = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/services", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/services`);
       const data = await response.json();
       setServices(data);
     } catch (err) {
       console.error("Error fetching services:", err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchBootstrapStatus = async () => {
+    try {
+      const response = await apiFetch(`/v1/bootstrap/status`);
+      const data = await response.json();
+      setBootstrapStatus(data);
+      
+      // Return the data so we can check it immediately in the interval
+      return data;
+    } catch (err) {
+      console.error("Error fetching bootstrap status:", err);
+      return null;
+    }
+  };
+
+  const migrateToPostgres = async () => {
+    if (!confirm("Migrate to PostgreSQL?\n\nThis will copy all data from SQLite to PostgreSQL. After migration completes, you'll need to restart the backend.")) {
+      return;
+    }
+
+    setMigrating(true);
+    try {
+      const response = await apiFetch(`/v1/bootstrap/migrate`, { method: "POST" });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || "Migration failed");
+      }
+
+      const result = await response.json();
+      alert(`✅ Migration completed!\n\n${result.message}\n\nClusters migrated: ${result.clusters_migrated}\nServices migrated: ${result.services_migrated}\n\nPlease restart the backend now.`);
+      await fetchBootstrapStatus();
+    } catch (err) {
+      alert(`Migration failed: ${err.message}`);
+    } finally {
+      setMigrating(false);
     }
   };
 
@@ -80,13 +137,9 @@ export default function Services() {
 
     // First, get the deployment plan
     try {
-      const token = localStorage.getItem("access_token");
-      const planResponse = await fetch("http://localhost:3000/v1/services/deployment-plan", {
+      const planResponse = await apiFetch(`/v1/services/deployment-plan`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cluster_id: cluster.id,
           name: serviceName,
@@ -126,13 +179,9 @@ export default function Services() {
     setShowPlanModal(false);
     
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/services", {
+      const response = await apiFetch(`/v1/services`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cluster_id: cluster.id,
           name: serviceName,
@@ -158,12 +207,8 @@ export default function Services() {
 
   const deleteService = async (service) => {
     try {
-      const token = localStorage.getItem("access_token");
-      
       // First, get the delete plan to see what will be deleted
-      const planResponse = await fetch(`http://localhost:3000/v1/services/${service.id}/delete-plan`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const planResponse = await apiFetch(`/v1/services/${service.id}/delete-plan`);
       
       if (!planResponse.ok) {
         throw new Error("Failed to get delete plan");
@@ -184,21 +229,25 @@ export default function Services() {
     if (!deletePlan) return;
 
     try {
-      const token = localStorage.getItem("access_token");
-      
       // Delete with cascade if there are dependents
       const cascade = deletePlan.dependents.length > 0;
-      await fetch(`http://localhost:3000/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
+      const response = await apiFetch(`/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
       });
+      
+      const result = await response.json();
       
       setShowDeleteModal(false);
       setDeletePlan(null);
       await fetchServices();
       
-      if (deletePlan.total_deletions > 1) {
+      // Check if restart is required (for postgres deletion)
+      if (result.restart_required) {
+        alert(`⚠️ RESTART REQUIRED\n\n${result.message}\n\n${result.warning || ''}`);
+      } else if (deletePlan.total_deletions > 1) {
         alert(`Successfully deleted ${deletePlan.total_deletions} services`);
+      } else {
+        alert(result.message || "Service deleted successfully");
       }
     } catch (err) {
       console.error("Error deleting service:", err);
@@ -207,6 +256,20 @@ export default function Services() {
   };
 
   const availableServices = [
+    {
+      name: "postgres",
+      displayName: "PostgreSQL Database",
+      description: "Production database for StreamLink. Enables migration from SQLite and is required for Keycloak authentication.",
+      icon: "🐘",
+      dependencies: [],
+    },
+    {
+      name: "keycloak",
+      displayName: "Keycloak (Authentication)",
+      description: "Identity and Access Management. Enables OAuth2 authentication for StreamLink. Requires PostgreSQL.",
+      icon: "🔐",
+      dependencies: ["postgres"],
+    },
     {
       name: "kafka",
       displayName: "Apache Kafka",
@@ -220,6 +283,27 @@ export default function Services() {
       description: "Confluent Schema Registry for managing Avro, JSON, and Protobuf schemas. Requires Kafka.",
       icon: "📋",
       dependencies: ["kafka"],
+    },
+    {
+      name: "kafka-connect",
+      displayName: "Kafka Connect",
+      description: "Distributed framework for connecting Kafka with external systems. Requires Kafka and Schema Registry.",
+      icon: "🔌",
+      dependencies: ["kafka", "schema-registry"],
+    },
+    {
+      name: "ksqldb",
+      displayName: "ksqlDB",
+      description: "Streaming SQL engine for Apache Kafka. Requires Kafka, Schema Registry, and Kafka Connect.",
+      icon: "💾",
+      dependencies: ["kafka", "schema-registry", "kafka-connect"],
+    },
+    {
+      name: "kafbat-ui",
+      displayName: "Kafbat UI",
+      description: "Web UI for managing and monitoring Apache Kafka clusters. Provides unified interface for all services.",
+      icon: "🎛️",
+      dependencies: ["kafka", "schema-registry", "kafka-connect", "ksqldb", "keycloak"],
     },
   ];
 
@@ -610,20 +694,45 @@ export default function Services() {
                       {service.replicas && ` • Replicas: ${service.replicas}`}
                     </div>
                   </div>
-                  <button
-                    onClick={() => deleteService(service)}
-                    style={{
-                      padding: "8px 16px",
-                      backgroundColor: "white",
-                      color: "#dc2626",
-                      border: "1px solid #fecaca",
-                      borderRadius: "4px",
-                      cursor: "pointer",
-                      fontSize: "13px",
-                    }}
-                  >
-                    Delete
-                  </button>
+                  <div style={{ display: "flex", gap: "10px" }}>
+                    {/* Show Migrate button only for postgres when migration is pending */}
+                    {service.manifest_name === "postgres" && 
+                     bootstrapStatus && 
+                     bootstrapStatus.postgres_deployed && 
+                     !bootstrapStatus.migration_complete && 
+                     bootstrapStatus.ready_for_migration && (
+                      <button
+                        onClick={migrateToPostgres}
+                        disabled={migrating}
+                        style={{
+                          padding: "8px 16px",
+                          backgroundColor: migrating ? "#d1d5db" : "#10b981",
+                          color: "white",
+                          border: "none",
+                          borderRadius: "4px",
+                          cursor: migrating ? "not-allowed" : "pointer",
+                          fontSize: "13px",
+                          fontWeight: "500",
+                        }}
+                      >
+                        {migrating ? "Migrating..." : "Migrate"}
+                      </button>
+                    )}
+                    <button
+                      onClick={() => deleteService(service)}
+                      style={{
+                        padding: "8px 16px",
+                        backgroundColor: "white",
+                        color: "#dc2626",
+                        border: "1px solid #fecaca",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                        fontSize: "13px",
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
                 </div>
               );
             })}

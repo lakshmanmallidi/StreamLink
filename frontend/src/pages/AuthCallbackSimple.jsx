@@ -1,10 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
+import { API_BASE_URL } from "../config";
 
 export default function AuthCallback() {
   const [message, setMessage] = useState("Processing login...");
   const [error, setError] = useState(null);
+  const hasProcessed = useRef(false);
 
   useEffect(() => {
+    // Prevent duplicate calls in React StrictMode
+    if (hasProcessed.current) return;
+    hasProcessed.current = true;
+
     const handleCallback = async () => {
       try {
         const params = new URLSearchParams(window.location.search);
@@ -16,20 +22,39 @@ export default function AuthCallback() {
           return;
         }
 
-        const response = await fetch("http://localhost:3000/v1/auth/callback", {
+        const response = await fetch(`${API_BASE_URL}/v1/auth/callback`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code, code_verifier: codeVerifier })
         });
 
         if (!response.ok) {
+          const ctErr = response.headers.get("content-type") || "";
+          if (!ctErr.includes("application/json")) {
+            const text = await response.text();
+            throw new Error(
+              `Callback failed with non-JSON response from ${API_BASE_URL}.\nPreview: ${text.slice(0, 120)}`
+            );
+          }
           const err = await response.json();
           throw new Error(err.detail || "Authentication failed");
         }
 
+        const ct = response.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) {
+          const text = await response.text();
+          throw new Error(
+            `Unexpected non-JSON callback response from ${API_BASE_URL}. Is VITE_API_URL pointing to backend?\nPreview: ${text.slice(0, 120)}`
+          );
+        }
         const data = await response.json();
         localStorage.setItem("access_token", data.access_token);
         localStorage.setItem("user", JSON.stringify(data.user));
+        
+        // Store id_token separately for logout
+        if (data.user.id_token) {
+          localStorage.setItem("id_token", data.user.id_token);
+        }
 
         setTimeout(() => {
           window.location.href = "/";
