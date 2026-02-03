@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 
 export default function Services() {
   const [services, setServices] = useState([]);
@@ -20,9 +21,16 @@ export default function Services() {
     fetchBootstrapStatus();
   }, []);
 
-  // Auto-refresh service status every 5 seconds
+  // Auto-refresh service status every 5 seconds (only while deploying)
   useEffect(() => {
     if (services.length === 0) return;
+    
+    // Only poll if there are services that are deploying, starting, or stopping
+    const hasActiveServices = services.some(s => 
+      s.status === "deploying" || s.status === "starting" || s.status === "stopping"
+    );
+    
+    if (!hasActiveServices) return;
 
     const interval = setInterval(() => {
       // Check status for each service in Kubernetes
@@ -32,10 +40,28 @@ export default function Services() {
     return () => clearInterval(interval);
   }, [services]);
 
+  // Poll bootstrap status every 5 seconds when postgres is deployed but migration not complete
+  useEffect(() => {
+    if (!bootstrapStatus) return;
+    
+    // Only poll if postgres is deployed but migration not ready/complete
+    if (bootstrapStatus.postgres_deployed && !bootstrapStatus.migration_complete) {
+      const interval = setInterval(async () => {
+        const status = await fetchBootstrapStatus();
+        // Stop polling immediately if migration completes
+        if (status && status.migration_complete) {
+          clearInterval(interval);
+        }
+      }, 5000);
+
+      return () => clearInterval(interval);
+    }
+  }, [bootstrapStatus]);
+
   const checkServiceStatus = async (serviceId) => {
     try {
       const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/services/${serviceId}/check-status`, {
+      await fetch(`${API_BASE_URL}/v1/services/${serviceId}/check-status`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -49,7 +75,7 @@ export default function Services() {
   const fetchCluster = async () => {
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
+      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
@@ -62,7 +88,7 @@ export default function Services() {
   const fetchServices = async () => {
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/services", {
+      const response = await fetch(`${API_BASE_URL}/v1/services`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
@@ -77,13 +103,17 @@ export default function Services() {
   const fetchBootstrapStatus = async () => {
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/bootstrap/status", {
+      const response = await fetch(`${API_BASE_URL}/v1/bootstrap/status`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
       setBootstrapStatus(data);
+      
+      // Return the data so we can check it immediately in the interval
+      return data;
     } catch (err) {
       console.error("Error fetching bootstrap status:", err);
+      return null;
     }
   };
 
@@ -95,7 +125,7 @@ export default function Services() {
     setMigrating(true);
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/bootstrap/migrate", {
+      const response = await fetch(`${API_BASE_URL}/v1/bootstrap/migrate`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -125,7 +155,7 @@ export default function Services() {
     // First, get the deployment plan
     try {
       const token = localStorage.getItem("access_token");
-      const planResponse = await fetch("http://localhost:3000/v1/services/deployment-plan", {
+      const planResponse = await fetch(`${API_BASE_URL}/v1/services/deployment-plan`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -171,7 +201,7 @@ export default function Services() {
     
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/services", {
+      const response = await fetch(`${API_BASE_URL}/v1/services`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -205,7 +235,7 @@ export default function Services() {
       const token = localStorage.getItem("access_token");
       
       // First, get the delete plan to see what will be deleted
-      const planResponse = await fetch(`http://localhost:3000/v1/services/${service.id}/delete-plan`, {
+      const planResponse = await fetch(`${API_BASE_URL}/v1/services/${service.id}/delete-plan`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       
@@ -232,7 +262,7 @@ export default function Services() {
       
       // Delete with cascade if there are dependents
       const cascade = deletePlan.dependents.length > 0;
-      const response = await fetch(`http://localhost:3000/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
+      const response = await fetch(`${API_BASE_URL}/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });

@@ -14,12 +14,13 @@ from src.models.service import Service
 from src.models.service_dependency import ServiceDependency
 from src.utils.crypto import get_crypto_service
 from src.config import settings
+from src.api.dependencies import verify_authentication
 from kubernetes import client, config
 import tempfile
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v1/bootstrap", tags=["Bootstrap"])
+router = APIRouter(prefix="/v1/bootstrap", tags=["Bootstrap"], dependencies=[Depends(verify_authentication)])
 
 
 class BootstrapStatusResponse(BaseModel):
@@ -60,13 +61,8 @@ async def get_bootstrap_status(db: AsyncSession = Depends(get_db)):
             ready_for_migration=False
         )
     
-    # Check if Keycloak is deployed (from services table)
-    keycloak_stmt = select(Service).where(
-        Service.manifest_name == "keycloak",
-        Service.is_active == True
-    )
-    keycloak_result = await db.execute(keycloak_stmt)
-    keycloak_deployed = keycloak_result.scalar_one_or_none() is not None
+    # Check if Keycloak is deployed from bootstrap state (more reliable than services table)
+    keycloak_deployed = bootstrap_state.keycloak_deployed if bootstrap_state else False
     
     # Check if Postgres pod is ready
     ready_for_migration = False
@@ -85,7 +81,20 @@ async def get_bootstrap_status(db: AsyncSession = Depends(get_db)):
 async def _check_postgres_ready(db: AsyncSession) -> bool:
     """Check if Postgres pod is ready using the shared helper."""
     try:
-        # Get the cluster (should only be one)
+        # First check if postgres service exists and is running in our database
+        # This is more reliable than checking the pod directly
+        stmt = select(Service).where(
+            Service.manifest_name == "postgres",
+            Service.is_active == True
+        )
+        result = await db.execute(stmt)
+        postgres_service = result.scalar_one_or_none()
+        
+        # If service exists and is marked as running, it's ready
+        if postgres_service and postgres_service.status == "running":
+            return True
+        
+        # Fallback to checking the pod directly (for edge cases)
         stmt = select(Cluster).limit(1)
         result = await db.execute(stmt)
         cluster = result.scalar_one_or_none()
@@ -143,21 +152,27 @@ async def migrate_to_postgres(db: AsyncSession = Depends(get_db)):
         
         logger.info(f"Migrating {len(clusters)} clusters, {len(services)} services, and {len(dependencies)} dependencies to Postgres")
         
-        # Get Postgres connection details from bootstrap state
+        # Get Postgres connection details from services table
+        postgres_service_stmt = select(Service).where(
+            Service.manifest_name == "postgres",
+            Service.is_active == True
+        )
+        postgres_service_result = await db.execute(postgres_service_stmt)
+        postgres_service = postgres_service_result.scalar_one_or_none()
+        
+        if not postgres_service or not postgres_service.password or not postgres_service.external_host:
+            raise HTTPException(status_code=500, detail="Postgres service credentials not found")
+        
         crypto = get_crypto_service()
-        postgres_password = crypto.decrypt(bootstrap_state.postgres_admin_password)
+        postgres_password = crypto.decrypt(postgres_service.password)
         
-        # Backend runs locally, must use external NodePort to connect
-        if not bootstrap_state.postgres_external_host:
-            raise HTTPException(status_code=500, detail="Postgres external host not found in bootstrap state")
-        
-        node_ip = bootstrap_state.postgres_external_host
-        node_port = bootstrap_state.postgres_external_port or str(settings.POSTGRES_NODEPORT)
+        node_ip = postgres_service.external_host
+        node_port = postgres_service.external_port or str(settings.POSTGRES_NODEPORT)
         
         # Debug logging
-        logger.info(f"Bootstrap state values:")
-        logger.info(f"  postgres_external_host: {bootstrap_state.postgres_external_host}")
-        logger.info(f"  postgres_external_port: {bootstrap_state.postgres_external_port}")
+        logger.info(f"Postgres service values:")
+        logger.info(f"  external_host: {postgres_service.external_host}")
+        logger.info(f"  external_port: {postgres_service.external_port}")
         logger.info(f"  Using node_ip: {node_ip}")
         logger.info(f"  Using node_port: {node_port}")
         logger.info(f"  Password length: {len(postgres_password) if postgres_password else 0}")

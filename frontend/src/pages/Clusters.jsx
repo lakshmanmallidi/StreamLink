@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 
 export default function Clusters() {
   const [cluster, setCluster] = useState(null);
@@ -24,7 +25,7 @@ export default function Clusters() {
   const fetchCluster = async () => {
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
+      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -41,7 +42,7 @@ export default function Clusters() {
   const checkStatus = async () => {
     try {
       const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/clusters/${cluster.id}/check-status`, {
+      await fetch(`${API_BASE_URL}/v1/clusters/${cluster.id}/check-status`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -58,7 +59,7 @@ export default function Clusters() {
     
     try {
       const token = localStorage.getItem("access_token");
-      await fetch(`http://localhost:3000/v1/clusters/${cluster.id}`, {
+      await fetch(`${API_BASE_URL}/v1/clusters/${cluster.id}`, {
         method: "DELETE",
         headers: {
           Authorization: `Bearer ${token}`,

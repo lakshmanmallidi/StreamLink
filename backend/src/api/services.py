@@ -14,17 +14,19 @@ import asyncio
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from src.database import get_db
+from src.database import get_db, get_database_url
 from src.models.service import Service
 from src.models.cluster import Cluster
+from src.models.bootstrap_state import BootstrapState
 from src.utils.crypto import get_crypto_service
 from src.utils.dependencies import dependency_resolver, SERVICE_DISPLAY_NAMES
 from src.utils.keycloak_admin import keycloak_admin
+from src.api.dependencies import verify_authentication
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v1/services", tags=["Services"])
+router = APIRouter(prefix="/v1/services", tags=["Services"], dependencies=[Depends(verify_authentication)])
 
 
 class ServiceDeploy(BaseModel):
@@ -200,6 +202,9 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
     except Exception as e:
         logger.error(f"Failed to create ConfigMap: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create global ConfigMap: {str(e)}")
+
+    # Note: Dependency ConfigMaps are created by consumer services (e.g., keycloak) during their deployment.
+    # We intentionally avoid creating consumer-specific config during provider (postgres) deployment.
     
     # Get missing dependencies
     missing_deps = dependency_resolver.get_missing_dependencies(data.name, installed_manifest_names)
@@ -300,18 +305,27 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
         service.status = "running"
         logger.info(f"✓ {deployed_name} is ready")
         
-        # For postgres, save credentials to bootstrap_state ONLY after pod is running
+        # For postgres, save credentials to service model after pod is running
         if data.name == "postgres" and metadata.get("postgres_password"):
-            from src.database import AsyncSessionLocal, get_database_url
-            from src.models.bootstrap_state import BootstrapState
+            from src.database import AsyncSessionLocal
             from sqlalchemy import select as sql_select
             
-            # Only save to SQLite during bootstrap (before migration)
+            crypto = get_crypto_service()
+            postgres_password = metadata.get("postgres_password")
+            node_ip = metadata.get("node_ip")
+            encrypted_password = crypto.encrypt(postgres_password)
+            
+            # Save credentials to the service record
+            service.username = "postgres"
+            service.password = encrypted_password
+            service.internal_host = "postgres.streamlink.svc.cluster.local"
+            service.internal_port = "5432"
+            if node_ip:
+                service.external_host = node_ip
+                service.external_port = str(settings.POSTGRES_NODEPORT)
+            
+            # Update bootstrap_state to mark postgres as deployed (only the flag)
             if "sqlite" in get_database_url().lower():
-                crypto = get_crypto_service()
-                postgres_password = metadata.get("postgres_password")
-                node_ip = metadata.get("node_ip")
-                
                 async with AsyncSessionLocal() as session:
                     stmt = sql_select(BootstrapState)
                     result = await session.execute(stmt)
@@ -321,29 +335,39 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
                         bootstrap_state = BootstrapState()
                         session.add(bootstrap_state)
                     
-                    encrypted_password = crypto.encrypt(postgres_password)
-                    bootstrap_state.postgres_admin_password = encrypted_password
                     bootstrap_state.postgres_deployed = True
-                    
-                    # Internal Kubernetes service endpoint
-                    bootstrap_state.postgres_internal_host = "postgres.streamlink.svc.cluster.local"
-                    bootstrap_state.postgres_internal_port = "5432"
-                    
-                    # External NodePort endpoint
-                    if node_ip:
-                        bootstrap_state.postgres_external_host = node_ip
-                        bootstrap_state.postgres_external_port = str(settings.POSTGRES_NODEPORT)
-                    
-                    # Legacy fields
-                    bootstrap_state.postgres_host = "postgres.streamlink.svc.cluster.local"
-                    bootstrap_state.postgres_port = "5432"
-                    
                     await session.commit()
-                    
-                    logger.info("✓ Postgres is READY - saved credentials to bootstrap state (SQLite)")
-                    logger.info(f"  Internal: postgres.streamlink.svc.cluster.local:5432")
-                    if node_ip:
-                        logger.info(f"  External: {node_ip}:{settings.POSTGRES_NODEPORT}")
+            
+            logger.info("✓ Postgres is READY - saved credentials to service record")
+            logger.info(f"  Internal: postgres.streamlink.svc.cluster.local:5432")
+            if node_ip:
+                logger.info(f"  External: {node_ip}:{settings.POSTGRES_NODEPORT}")
+        
+        # For keycloak, save credentials to service model after pod is running
+        elif data.name == "keycloak" and metadata.get("keycloak_admin_password"):
+            crypto = get_crypto_service()
+            keycloak_admin_password = metadata.get("keycloak_admin_password")
+            node_ip = metadata.get("node_ip")
+            encrypted_password = crypto.encrypt(keycloak_admin_password)
+            
+            # Save credentials and config to the service record
+            service.username = "admin"
+            service.password = encrypted_password
+            service.internal_host = "keycloak.streamlink.svc.cluster.local"
+            service.internal_port = "8080"
+            if node_ip:
+                service.external_host = node_ip
+                service.external_port = str(settings.KEYCLOAK_NODEPORT)
+                
+                # Store external URL in config for auth endpoints
+                import json
+                external_url = f"http://{node_ip}:{settings.KEYCLOAK_NODEPORT}"
+                service.config = json.dumps({"external_url": external_url})
+            
+            logger.info("✓ Keycloak is READY - saved credentials to service record")
+            logger.info(f"  Internal: keycloak.streamlink.svc.cluster.local:8080")
+            if node_ip:
+                logger.info(f"  External: {node_ip}:{settings.KEYCLOAK_NODEPORT}")
     else:
         service.status = "failed"
         logger.error(f"✗ {deployed_name} failed to become ready")
@@ -360,11 +384,21 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
             
             logger.info("Initializing Keycloak realm...")
             from src.utils.keycloak_admin import KeycloakAdmin
+            from src.models.oauth_client import OAuthClient
+            import json
             
-            # Create temporary KeycloakAdmin instance
+            # Create temporary KeycloakAdmin instance using stored credentials
+            # Use external_host for connections from outside the cluster
             keycloak_temp = KeycloakAdmin()
-            keycloak_temp.base_url = "http://keycloak.streamlink.svc.cluster.local:8080"
-            keycloak_temp.admin_password = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")  # Get from env or config
+            keycloak_url = f"http://{service.external_host}:{service.external_port}" if service.external_host else "http://keycloak.streamlink.svc.cluster.local:8080"
+            keycloak_temp.base_url = keycloak_url
+            crypto = get_crypto_service()
+            try:
+                admin_password = crypto.decrypt(service.password) if service.password else ""
+            except Exception:
+                admin_password = ""
+            keycloak_temp.admin_password = admin_password
+            logger.info(f"Using Keycloak URL: {keycloak_url}")
             
             # Create the streamlink realm
             await keycloak_temp.create_realm("streamlink", "StreamLink Platform")
@@ -373,16 +407,46 @@ async def deploy_service(data: ServiceDeploy, db: AsyncSession = Depends(get_db)
             # Update keycloak instance to use new realm
             keycloak_temp.realm = "streamlink"
             
-            # Create streamlink-api client
+            # Create streamlink-api client with redirect URI from config
             api_client_id, api_client_secret = await keycloak_temp.create_client(
-                client_id="streamlink-api",
-                redirect_uris=["http://localhost:5173/*", "http://localhost:3000/*"],
+                client_id=settings.KEYCLOAK_STREAMLINK_API_CLIENT_ID,
+                redirect_uris=[settings.KEYCLOAK_STREAMLINK_API_REDIRECT_URI],
+                post_logout_uris=[settings.KEYCLOAK_STREAMLINK_API_POST_LOGOUT_URI],
                 description="StreamLink API Client"
             )
             logger.info(f"Created Keycloak client: {api_client_id}")
             
+            # Store client credentials in database (encrypted)
+            encrypted_secret = crypto.encrypt(api_client_secret)
+            oauth_client = OAuthClient(
+                client_id=api_client_id,
+                client_secret=encrypted_secret,
+                realm="streamlink",
+                redirect_uris=json.dumps([settings.KEYCLOAK_STREAMLINK_API_REDIRECT_URI]),
+                description="StreamLink API Client",
+                is_active=True
+            )
+            db.add(oauth_client)
+            await db.commit()
+            logger.info(f"✓ Stored OAuth client '{api_client_id}' credentials in database (encrypted)")
+            
+            # Mark Keycloak as deployed in bootstrap state (works for both SQLite and Postgres)
+            stmt = select(BootstrapState)
+            result = await db.execute(stmt)
+            bootstrap_state = result.scalar_one_or_none()
+            
+            if not bootstrap_state:
+                bootstrap_state = BootstrapState()
+                db.add(bootstrap_state)
+            
+            bootstrap_state.keycloak_deployed = True
+            await db.commit()
+            logger.info("✓ Marked Keycloak as deployed in bootstrap state - OAuth authentication is now active")
+            
         except Exception as e:
             logger.warning(f"Failed to initialize Keycloak realm (you can do this manually later): {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     logger.info(f"Service {service.name} and all dependencies deployed successfully.")
     
@@ -591,6 +655,39 @@ async def delete_service(service_id: str, cascade: bool = False, db: AsyncSessio
                     import traceback
                     traceback.print_exc()
                     # Don't fail the delete operation if Keycloak cleanup fails
+            
+            # Special handling for keycloak: Delete OAuth clients from database and reset bootstrap flag
+            if service.manifest_name == "keycloak":
+                try:
+                    from src.models.oauth_client import OAuthClient
+                    logger.info("Cleaning up Keycloak OAuth clients from database...")
+                    
+                    # Delete all OAuth clients
+                    stmt = select(OAuthClient)
+                    result = await db.execute(stmt)
+                    oauth_clients = result.scalars().all()
+                    
+                    for client in oauth_clients:
+                        await db.delete(client)
+                        logger.info(f"Deleted OAuth client: {client.client_id}")
+                    
+                    # Reset keycloak_deployed flag in bootstrap_state
+                    stmt = select(BootstrapState)
+                    result = await db.execute(stmt)
+                    bootstrap_state = result.scalar_one_or_none()
+                    
+                    if bootstrap_state:
+                        bootstrap_state.keycloak_deployed = False
+                        logger.info("Reset keycloak_deployed flag in bootstrap_state")
+                    
+                    await db.commit()
+                    logger.info("Keycloak cleanup completed - OAuth authentication disabled")
+                    
+                except Exception as e:
+                    logger.error(f"Keycloak database cleanup failed: {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Don't fail the delete operation
                     
         except Exception as e:
             logger.error(f"Failed to delete from Kubernetes: {type(e).__name__}: {e}")
@@ -746,9 +843,7 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
         with open(manifest_path, 'r') as f:
             manifest_content = f.read()
         
-        # Replace NodePort placeholders with values from config
-        manifest_content = manifest_content.replace('POSTGRES_NODEPORT', str(settings.POSTGRES_NODEPORT))
-        manifest_content = manifest_content.replace('KEYCLOAK_NODEPORT', str(settings.KEYCLOAK_NODEPORT))
+        # No more string replacements - NodePorts come from ConfigMap
         
         # Special handling for postgres and keycloak - generate passwords and create secrets
         postgres_password = None
@@ -780,12 +875,213 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
                     raise
             
         elif service_name == "keycloak":
-            logger.info("Generating passwords for Keycloak deployment")
-            alphabet = string.ascii_letters + string.digits + string.punctuation
+            logger.info("Generating admin password for Keycloak deployment")
+            # Use a safe alphabet that avoids shell/SQL-breaking characters (' " \ $)
+            safe_punct = "@#%+=-_.:,;!?"  # excludes quotes, backslash, dollar
+            alphabet = string.ascii_letters + string.digits + safe_punct
             keycloak_admin_password = ''.join(secrets.choice(alphabet) for _ in range(32))
-            keycloak_db_password = ''.join(secrets.choice(alphabet) for _ in range(32))
-            manifest_content = manifest_content.replace('PLACEHOLDER_ADMIN_PASSWORD', keycloak_admin_password)
-            manifest_content = manifest_content.replace('PLACEHOLDER_PASSWORD', keycloak_db_password)
+            
+            core_v1 = client.CoreV1Api()
+            
+            # 1) Ensure Keycloak admin secret
+            admin_secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name="keycloak-secret", namespace="streamlink"),
+                string_data={
+                    "admin-password": keycloak_admin_password
+                }
+            )
+            try:
+                core_v1.create_namespaced_secret(namespace="streamlink", body=admin_secret)
+                logger.info("✓ Created Kubernetes Secret 'keycloak-secret'")
+            except ApiException as e:
+                if e.status == 409:
+                    core_v1.patch_namespaced_secret(name="keycloak-secret", namespace="streamlink", body=admin_secret)
+                    logger.info("✓ Updated Kubernetes Secret 'keycloak-secret'")
+                else:
+                    raise
+
+            # 2) Create dependency secrets for consumers (postgres superuser password for init)
+            # Read postgres password from existing secret (preferred) or DB service record
+            pg_root_password = ""
+            try:
+                existing_pg = core_v1.read_namespaced_secret(name="postgres-secret", namespace="streamlink")
+                if getattr(existing_pg, 'data', None) and existing_pg.data.get("postgres-password"):
+                    import base64
+                    pg_root_password = base64.b64decode(existing_pg.data["postgres-password"]).decode("utf-8")
+            except ApiException:
+                pass
+            if not pg_root_password:
+                from src.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as session:
+                    res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                    pg_service = res.scalar_one_or_none()
+                    if pg_service and pg_service.password:
+                        crypto_local = get_crypto_service()
+                        try:
+                            pg_root_password = crypto_local.decrypt(pg_service.password)
+                        except Exception:
+                            pg_root_password = ""
+
+            deps_secret = client.V1Secret(
+                metadata=client.V1ObjectMeta(name="streamlink-deps-secrets", namespace="streamlink"),
+                string_data={
+                    "postgres_password": pg_root_password
+                }
+            )
+            try:
+                core_v1.create_namespaced_secret(namespace="streamlink", body=deps_secret)
+                logger.info("✓ Created Kubernetes Secret 'streamlink-deps-secrets'")
+            except ApiException as e:
+                if e.status == 409:
+                    core_v1.patch_namespaced_secret(name="streamlink-deps-secrets", namespace="streamlink", body=deps_secret)
+                    logger.info("✓ Updated Kubernetes Secret 'streamlink-deps-secrets'")
+                else:
+                    raise
+
+            # 3) Ensure dependency ConfigMap with Postgres internal host/port and JDBC URL
+            # Try to read postgres secret to ensure connectivity; if missing, recreate from DB service
+            try:
+                core_v1.read_namespaced_secret(name="postgres-secret", namespace="streamlink")
+            except ApiException as e:
+                if e.status == 404:
+                    logger.info("postgres-secret missing; attempting to recreate from DB service record")
+                    from src.database import AsyncSessionLocal
+                    async with AsyncSessionLocal() as session:
+                        res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                        pg_service = res.scalar_one_or_none()
+                        if pg_service and pg_service.password:
+                            crypto_local = get_crypto_service()
+                            try:
+                                pg_password_plain = crypto_local.decrypt(pg_service.password)
+                            except Exception:
+                                pg_password_plain = ""
+                            if pg_password_plain:
+                                pg_secret = client.V1Secret(
+                                    metadata=client.V1ObjectMeta(name="postgres-secret", namespace="streamlink"),
+                                    string_data={"postgres-password": pg_password_plain}
+                                )
+                                try:
+                                    core_v1.create_namespaced_secret(namespace="streamlink", body=pg_secret)
+                                    logger.info("✓ Recreated 'postgres-secret' from DB")
+                                except ApiException as e2:
+                                    if e2.status == 409:
+                                        core_v1.patch_namespaced_secret(name="postgres-secret", namespace="streamlink", body=pg_secret)
+                                        logger.info("✓ Updated 'postgres-secret' from DB")
+                                    else:
+                                        raise
+                        else:
+                            logger.warning("Postgres service record not found or no password stored; proceeding")
+                else:
+                    raise
+
+            # Build ConfigMap data (only internal host per spec)
+            postgres_host = "postgres.streamlink.svc.cluster.local"
+            from src.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(select(Service).where(Service.manifest_name=="postgres", Service.cluster_id==cluster.id, Service.is_active==True))
+                pg_service = res.scalar_one_or_none()
+                if pg_service:
+                    postgres_host = pg_service.internal_host or postgres_host
+
+            deps_config = client.V1ConfigMap(
+                metadata=client.V1ObjectMeta(name="streamlink-deps", namespace="streamlink"),
+                data={
+                    "postgres_internal_host": postgres_host
+                }
+            )
+            try:
+                core_v1.create_namespaced_config_map(namespace="streamlink", body=deps_config)
+                logger.info("✓ Created ConfigMap 'streamlink-deps'")
+            except ApiException as e:
+                if e.status == 409:
+                    core_v1.replace_namespaced_config_map(name="streamlink-deps", namespace="streamlink", body=deps_config)
+                    logger.info("✓ Updated ConfigMap 'streamlink-deps'")
+                else:
+                    raise
+
+            # 4) Run init Job to create keycloak user and database
+            from kubernetes.client import V1EnvVar
+            job_manifest = {
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "keycloak-db-init", "namespace": "streamlink"},
+                "spec": {
+                    "backoffLimit": 2,
+                    "template": {
+                        "metadata": {"labels": {"app": "keycloak-db-init"}},
+                        "spec": {
+                            "restartPolicy": "Never",
+                            "containers": [
+                                {
+                                    "name": "psql",
+                                    "image": "postgres:15-alpine",
+                                    "env": [
+                                        {"name": "POSTGRES_HOST", "valueFrom": {"configMapKeyRef": {"name": "streamlink-deps", "key": "postgres_internal_host"}}},
+                                        {"name": "PGPASSWORD", "valueFrom": {"secretKeyRef": {"name": "streamlink-deps-secrets", "key": "postgres_password"}}},
+                                        {"name": "KEYCLOAK_DB_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "keycloak-secret", "key": "admin-password"}}}
+                                    ],
+                                    "command": ["sh","-c"],
+                                    "args": [
+                                        "ESC_PWD=$(printf %s \"$KEYCLOAK_DB_PASSWORD\" | sed \"s/'/''/g\"); DB_EXISTS=$(psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='keycloak'\"); if [ \"$DB_EXISTS\" = \"1\" ]; then echo 'Dropping existing keycloak database to reset with new password...'; psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"DROP DATABASE keycloak\"; fi; ROLE_EXISTS=$(psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname='keycloak'\"); if [ \"$ROLE_EXISTS\" != \"1\" ]; then psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"CREATE USER keycloak WITH PASSWORD '$ESC_PWD'\"; else psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"ALTER USER keycloak WITH PASSWORD '$ESC_PWD'\"; fi; psql -h \"$POSTGRES_HOST\" -U postgres -d postgres -v ON_ERROR_STOP=1 -c \"CREATE DATABASE keycloak OWNER keycloak\""
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            from kubernetes import utils as k8s_utils
+            from kubernetes.client import BatchV1Api
+            k8s_client = client.ApiClient()
+            batch_v1 = BatchV1Api()
+
+            # Ensure idempotency: delete existing job if present, wait for deletion
+            try:
+                batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                logger.info("Existing Job 'keycloak-db-init' found; deleting before recreate")
+                batch_v1.delete_namespaced_job(name="keycloak-db-init", namespace="streamlink", propagation_policy="Foreground")
+                import time
+                start_del = time.time()
+                while time.time() - start_del < 60:
+                    try:
+                        batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                        time.sleep(2)
+                    except ApiException as e:
+                        if e.status == 404:
+                            break
+                        else:
+                            raise
+            except ApiException as e:
+                if e.status != 404:
+                    raise
+
+            # Create Job
+            k8s_utils.create_from_dict(k8s_client, job_manifest)
+            logger.info("✓ Created Job 'keycloak-db-init'")
+
+            # Wait for job completion
+            from kubernetes.client import BatchV1Api
+            batch_v1 = BatchV1Api()
+            import time
+            start = time.time()
+            while time.time() - start < 180:
+                job = batch_v1.read_namespaced_job(name="keycloak-db-init", namespace="streamlink")
+                if job.status.succeeded and job.status.succeeded >= 1:
+                    logger.info("✓ Keycloak DB init job succeeded")
+                    break
+                if job.status.failed and job.status.failed >= 1:
+                    logger.error("✗ Keycloak DB init job failed")
+                    raise RuntimeError("Keycloak DB initialization failed")
+                await asyncio.sleep(5)
+            
+            # Clean up the job after completion
+            try:
+                batch_v1.delete_namespaced_job(name="keycloak-db-init", namespace="streamlink", propagation_policy="Background")
+                logger.info("✓ Deleted Job 'keycloak-db-init' after completion")
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"Failed to delete Job 'keycloak-db-init': {e}")
+
         
         # Apply the manifest using kubectl-like approach - respect namespace from YAML
         from kubernetes import utils
@@ -806,6 +1102,8 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
                 # Capture the actual deployed name from Deployment/StatefulSet resources
                 if kind in ['Deployment', 'StatefulSet'] and 'name' in doc['metadata']:
                     deployed_name = doc['metadata']['name']
+
+            # No dynamic env injection; YAML consumes ConfigMap and Secrets directly
             
             # Apply based on resource type
             if kind == "Namespace":
@@ -906,38 +1204,9 @@ async def _deploy_to_kubernetes(cluster: Cluster, service_name: str) -> tuple[st
             metadata["node_ip"] = node_ip
             
         elif service_name == "keycloak" and keycloak_admin_password:
-            # Save Keycloak config to the service record (not bootstrap_state)
-            # Find the keycloak service we just deployed
-            stmt = select(Service).where(
-                Service.cluster_id == cluster.id,
-                Service.manifest_name == "keycloak",
-                Service.is_active == True
-            )
-            result = await session.execute(stmt)
-            keycloak_svc = result.scalar_one_or_none()
-            
-            if keycloak_svc:
-                import json
-                encrypted_password = crypto.encrypt(keycloak_admin_password)
-                
-                # Store config in service.config JSON field
-                config = {
-                    "admin_password": encrypted_password,
-                    "internal_url": "http://keycloak.streamlink.svc.cluster.local:8080",
-                    "realm": "streamlink"
-                }
-                
-                if node_ip:
-                    config["external_url"] = f"http://{node_ip}:{settings.KEYCLOAK_NODEPORT}"
-                    config["node_ip"] = node_ip
-                    config["node_port"] = str(settings.KEYCLOAK_NODEPORT)
-                
-                keycloak_svc.config = json.dumps(config)
-                
-                logger.info(f"Saved Keycloak credentials and endpoints to service config")
-                logger.info(f"  Internal: http://keycloak.streamlink.svc.cluster.local:8080")
-                if node_ip:
-                    logger.info(f"  External: http://{node_ip}:{settings.KEYCLOAK_NODEPORT}")
+            # Pass admin password and node info via metadata; actual DB save occurs after pod is ready
+            metadata["keycloak_admin_password"] = keycloak_admin_password
+            metadata["node_ip"] = node_ip
         
         await session.commit()
     
@@ -1295,6 +1564,21 @@ async def _ensure_global_config(cluster, namespace: str = "streamlink"):
     
     with kube_config_context(cluster):
         
+        # Ensure namespace exists first
+        core_v1 = client.CoreV1Api()
+        try:
+            core_v1.read_namespace(namespace)
+        except ApiException as e:
+            if e.status == 404:
+                # Create namespace if it doesn't exist
+                namespace_manifest = client.V1Namespace(
+                    metadata=client.V1ObjectMeta(name=namespace)
+                )
+                core_v1.create_namespace(namespace_manifest)
+                logger.info(f"✓ Created namespace '{namespace}'")
+            else:
+                raise
+        
         # Auto-generate config data from settings object
         config_data = {}
         
@@ -1352,4 +1636,98 @@ async def _ensure_global_config(cluster, namespace: str = "streamlink"):
                 logger.info(f"✅ Updated ConfigMap 'streamlink-config' with {len(config_data)} config values")
             else:
                 logger.error(f"❌ Failed to create/update ConfigMap: {e.status} - {e.reason}")
+                raise
+
+
+async def _ensure_dependency_config(cluster: Cluster, db: AsyncSession, namespace: str = "streamlink"):
+    """Publish dependency information (internal hosts/ports) and ensure required secrets.
+
+    Currently supports Postgres. Creates/updates ConfigMap 'streamlink-deps' with:
+    - postgres-host, postgres-port
+    - keycloak-db-username (for consumers)
+    - keycloak-db-url (computed JDBC URL for Keycloak)
+
+    Also ensures 'postgres-secret' exists, creating from DB if missing.
+    """
+    from src.utils.kubernetes import kube_config_context
+
+    with kube_config_context(cluster):
+        core_v1 = client.CoreV1Api()
+
+        # Ensure namespace exists
+        try:
+            core_v1.read_namespace(namespace)
+        except ApiException as e:
+            if e.status == 404:
+                ns = client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace))
+                core_v1.create_namespace(ns)
+                logger.info(f"✓ Created namespace '{namespace}' for dependency config")
+            else:
+                raise
+
+        # Ensure postgres-secret exists. If missing, recreate from Service record.
+        need_pg_secret = False
+        try:
+            core_v1.read_namespaced_secret("postgres-secret", namespace)
+        except ApiException as e:
+            if e.status == 404:
+                need_pg_secret = True
+            else:
+                raise
+
+        if need_pg_secret:
+            logger.info("postgres-secret not found. Attempting to recreate from DB service record...")
+            stmt = select(Service).where(Service.cluster_id == cluster.id, Service.manifest_name == "postgres", Service.is_active == True)
+            res = await db.execute(stmt)
+            pg_service = res.scalar_one_or_none()
+            if pg_service and pg_service.password:
+                crypto = get_crypto_service()
+                try:
+                    pg_pwd = crypto.decrypt(pg_service.password)
+                except Exception:
+                    pg_pwd = ""
+                if pg_pwd:
+                    secret = client.V1Secret(
+                        metadata=client.V1ObjectMeta(name="postgres-secret", namespace=namespace),
+                        string_data={"postgres-password": pg_pwd}
+                    )
+                    try:
+                        core_v1.create_namespaced_secret(namespace, secret)
+                        logger.info("✓ Recreated 'postgres-secret' from DB")
+                    except ApiException as e:
+                        if e.status == 409:
+                            core_v1.patch_namespaced_secret("postgres-secret", namespace, secret)
+                            logger.info("✓ Updated 'postgres-secret' from DB")
+                        else:
+                            raise
+            else:
+                logger.warning("Cannot recreate 'postgres-secret': missing service record or password")
+
+        # Publish internal host/port via ConfigMap
+        postgres_host = "postgres.streamlink.svc.cluster.local"
+        postgres_port = "5432"
+        stmt = select(Service).where(Service.cluster_id == cluster.id, Service.manifest_name == "postgres", Service.is_active == True)
+        res = await db.execute(stmt)
+        pg_service = res.scalar_one_or_none()
+        if pg_service:
+            postgres_host = pg_service.internal_host or postgres_host
+            postgres_port = pg_service.internal_port or postgres_port
+
+        deps_map = client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(name="streamlink-deps", namespace=namespace),
+            data={
+                "postgres-host": postgres_host,
+                "postgres-port": postgres_port,
+                "keycloak-db-username": "keycloak",
+                "keycloak-db-url": f"jdbc:postgresql://{postgres_host}:{postgres_port}/keycloak"
+            }
+        )
+        try:
+            core_v1.create_namespaced_config_map(namespace, deps_map)
+            logger.info("✓ Created ConfigMap 'streamlink-deps'")
+        except ApiException as e:
+            if e.status == 409:
+                core_v1.replace_namespaced_config_map("streamlink-deps", namespace, deps_map)
+                logger.info("✓ Updated ConfigMap 'streamlink-deps'")
+            else:
                 raise

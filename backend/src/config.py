@@ -22,10 +22,12 @@ class Settings(BaseSettings):
     POSTGRES_NODEPORT: int = 30432
     KEYCLOAK_NODEPORT: int = 30081
 
-    # CORS Configuration
+    # CORS Configuration (exact origins with protocol)
     CORS_ORIGINS: List[str] = [
         "http://localhost:3001",
         "http://localhost:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3000",
     ]
     ALLOWED_HOSTS: List[str] = ["*"]
     
@@ -35,7 +37,7 @@ class Settings(BaseSettings):
     # Keycloak OAuth Client Configuration (for StreamLink API)
     KEYCLOAK_STREAMLINK_API_CLIENT_ID: str = "streamlink-api"
     KEYCLOAK_STREAMLINK_API_REDIRECT_URI: str = "http://localhost:3001/auth/callback"
-    KEYCLOAK_STREAMLINK_API_CLIENT_SECRET: str = Field(default="", json_schema_extra={'secret': True})
+    KEYCLOAK_STREAMLINK_API_POST_LOGOUT_URI: str = "http://localhost:3001/login"
     
     # Keycloak OAuth Client Configuration (for Kafbat UI)
     KEYCLOAK_KAFBAT_UI_CLIENT_ID: str = "kafbat-ui"

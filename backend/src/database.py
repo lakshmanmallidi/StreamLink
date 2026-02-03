@@ -19,6 +19,8 @@ def _check_postgres_deployed() -> tuple[bool, str | None, str | None, str | None
     
     Important: Backend only switches to Postgres after migration is complete,
     not just when Postgres is deployed.
+    
+    Reads credentials from services table instead of bootstrap_state.
     """
     db_path = os.path.join(os.path.dirname(__file__), "..", "bootstrap.db")
     
@@ -28,15 +30,27 @@ def _check_postgres_deployed() -> tuple[bool, str | None, str | None, str | None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
+        
+        # Check bootstrap flags
         cursor.execute(
-            "SELECT postgres_deployed, migration_complete, postgres_admin_password, postgres_external_host, postgres_external_port FROM bootstrap_state LIMIT 1"
+            "SELECT postgres_deployed, migration_complete FROM bootstrap_state LIMIT 1"
         )
         row = cursor.fetchone()
+        
+        # Only proceed if BOTH postgres is deployed AND migration is complete
+        if not (row and row[0] and row[1]):  # postgres_deployed AND migration_complete
+            conn.close()
+            return False, None, None, None
+        
+        # Get credentials from services table
+        cursor.execute(
+            "SELECT password, external_host, external_port FROM services WHERE manifest_name = 'postgres' AND is_active = 1 LIMIT 1"
+        )
+        service_row = cursor.fetchone()
         conn.close()
         
-        # Only return True if BOTH postgres is deployed AND migration is complete
-        if row and row[0] and row[1]:  # postgres_deployed AND migration_complete
-            return True, row[2], row[3], row[4]  # encrypted password, host, port
+        if service_row:
+            return True, service_row[0], service_row[1], service_row[2]  # encrypted password, host, port
     except Exception:
         pass
     

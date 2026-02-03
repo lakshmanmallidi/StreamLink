@@ -187,6 +187,7 @@ class KeycloakAdmin:
         self, 
         client_id: str, 
         redirect_uris: list[str],
+        post_logout_uris: list[str] = None,
         description: str = ""
     ) -> Tuple[str, str]:
         """
@@ -195,6 +196,7 @@ class KeycloakAdmin:
         Args:
             client_id: The client ID
             redirect_uris: List of valid redirect URIs
+            post_logout_uris: List of valid post-logout redirect URIs (defaults to redirect_uris base URLs)
             description: Optional client description
             
         Returns:
@@ -209,6 +211,16 @@ class KeycloakAdmin:
         token = await self._get_admin_token()
         url = f"{self.base_url}/admin/realms/{self.realm}/clients"
         
+        # Use provided post_logout_uris or extract base URLs from redirect URIs
+        from urllib.parse import urlparse
+        if post_logout_uris is None:
+            post_logout_uris = []
+            for uri in redirect_uris:
+                parsed = urlparse(uri)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+                if base_url not in post_logout_uris:
+                    post_logout_uris.append(base_url)
+        
         client_data = {
             "clientId": client_id,
             "name": client_id,
@@ -218,11 +230,19 @@ class KeycloakAdmin:
             "publicClient": False,
             "standardFlowEnabled": True,
             "directAccessGrantsEnabled": True,
-            "serviceAccountsEnabled": False,
+            "serviceAccountsEnabled": True,
+            "authorizationServicesEnabled": True,
+            "fullScopeAllowed": True,
+            "frontchannelLogout": True,
             "redirectUris": redirect_uris,
             "webOrigins": ["+"],  # Allow CORS from redirect URIs
+            "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"],
+            "optionalClientScopes": ["address", "phone", "offline_access", "microprofile-jwt"],
             "attributes": {
-                "access.token.lifespan": "900"
+                "access.token.lifespan": "900",
+                "backchannel.logout.session.required": "true",
+                "backchannel.logout.revoke.offline.tokens": "false",
+                "post.logout.redirect.uris": "##".join(post_logout_uris)
             }
         }
         
@@ -292,6 +312,68 @@ class KeycloakAdmin:
                 raise Exception(f"Failed to delete client: {response.text}")
             
             return response.status_code == 204
+    
+    async def verify_token(self, access_token: str) -> Optional[dict]:
+        """Verify access token and get user info from Keycloak.
+        
+        Returns user info if token is valid, None otherwise.
+        """
+        # Load config if not already loaded
+        if not self.base_url:
+            await self._load_config_async()
+        
+        if not self.base_url:
+            return None
+        
+        url = f"{self.base_url}/realms/{self.realm}/protocol/openid-connect/userinfo"
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    return None
+        except Exception:
+            return None
+    
+    async def _load_config_async(self):
+        """Load Keycloak configuration asynchronously from database."""
+        try:
+            from src.database import AsyncSessionLocal
+            from sqlalchemy import select
+            import json
+            
+            async with AsyncSessionLocal() as session:
+                from src.models.service import Service
+                stmt = select(Service).where(
+                    Service.manifest_name == "keycloak",
+                    Service.is_active == True
+                )
+                result = await session.execute(stmt)
+                keycloak_service = result.scalar_one_or_none()
+                
+                if keycloak_service and keycloak_service.config:
+                    config = json.loads(keycloak_service.config)
+                    self.base_url = config.get("external_url")
+                    
+                    # Load admin password if available
+                    if keycloak_service.password:
+                        from src.utils.crypto import get_crypto_service
+                        crypto = get_crypto_service()
+                        self.admin_password = crypto.decrypt(keycloak_service.password)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to load Keycloak config: {e}")
+        
+        # Fallback to localhost if not configured
+        if not self.base_url:
+            self.base_url = f"http://localhost:{settings.KEYCLOAK_NODEPORT}"
 
 
 # Singleton instance

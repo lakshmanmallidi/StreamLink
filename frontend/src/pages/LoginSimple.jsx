@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 
 export default function Login() {
   const [loading, setLoading] = useState(false);
@@ -8,7 +9,7 @@ export default function Login() {
 
   useEffect(() => {
     // Check auth status
-    fetch("http://localhost:3000/v1/auth/status")
+    fetch(`${API_BASE_URL}/v1/auth/status`)
       .then((res) => res.json())
       .then((data) => setAuthStatus(data))
       .catch(() => setAuthStatus({ auth_enabled: true }));
@@ -17,7 +18,7 @@ export default function Login() {
   const handleKeycloakLogin = async () => {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:3000/v1/auth/login-url");
+      const response = await fetch(`${API_BASE_URL}/v1/auth/login-url`);
       const data = await response.json();
       
       sessionStorage.setItem("pkce_code_verifier", data.code_verifier);
@@ -31,7 +32,7 @@ export default function Login() {
   const handleSimpleLogin = async () => {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:3000/v1/auth/simple-login", {
+      const response = await fetch(`${API_BASE_URL}/v1/auth/simple-login`, {
         method: "POST",
       });
       const data = await response.json();

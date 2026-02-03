@@ -24,5 +24,18 @@ class Service(Base):
     config = Column(Text, nullable=True)  # JSON config for the service
     last_checked = Column(DateTime, nullable=True)
     is_active = Column(Boolean, default=True)
+    
+    # Service credentials and connection details
+    username = Column(String(255), nullable=True)  # Service username (e.g., "postgres", "admin")
+    password = Column(String, nullable=True)  # Encrypted password (stored encrypted with ENCRYPTION_KEY)
+    
+    # Internal Kubernetes service endpoints (ClusterIP services)
+    internal_host = Column(String(255), nullable=True)  # e.g., "postgres.streamlink.svc.cluster.local"
+    internal_port = Column(String(50), nullable=True)  # e.g., "5432", "9092"
+    
+    # External Kubernetes service endpoints (NodePort services)
+    external_host = Column(String(255), nullable=True)  # Node IP for external access
+    external_port = Column(String(50), nullable=True)  # NodePort for external access
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

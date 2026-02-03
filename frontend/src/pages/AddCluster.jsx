@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { API_BASE_URL } from "../config";
 
 export default function AddCluster() {
   const [formData, setFormData] = useState({
@@ -18,7 +19,7 @@ export default function AddCluster() {
 
     try {
       const token = localStorage.getItem("access_token");
-      const response = await fetch("http://localhost:3000/v1/clusters", {
+      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -138,7 +139,7 @@ export default function AddCluster() {
               }}
             />
             <p style={{ margin: "6px 0 0 0", fontSize: "12px", color: "#6b7280" }}>
-              Get this from: kubectl config view --raw
+              Get this from: kubectl config view --raw --minify
             </p>
           </div>
 

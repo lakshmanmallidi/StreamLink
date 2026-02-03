@@ -19,10 +19,11 @@ import urllib3
 from src.database import get_db
 from src.models.cluster import Cluster
 from src.utils.crypto import get_crypto_service
+from src.api.dependencies import verify_authentication
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v1/clusters", tags=["Clusters"])
+router = APIRouter(prefix="/v1/clusters", tags=["Clusters"], dependencies=[Depends(verify_authentication)])
 
 
 class ClusterCreate(BaseModel):

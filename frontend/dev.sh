@@ -17,8 +17,12 @@ if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
     npm install
 fi
 
+# Set environment variables for development
+export VITE_API_URL="http://localhost:3000"
+
 # Run development server
 echo "Starting frontend on http://localhost:3001"
+echo "API URL: $VITE_API_URL"
 
 cd "$FRONTEND_DIR"
 npm run dev
