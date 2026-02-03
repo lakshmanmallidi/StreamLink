@@ -24,16 +24,59 @@ spec:
           value: "true"
         - name: KAFKA_CLUSTERS_0_NAME
           value: "streamlink-kafka"
+        # Base endpoints first (so $(VAR) expansion works)
+        - name: KAFKA_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_host
+        - name: KAFKA_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_port
         - name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS
-          value: "kafka.streamlink.svc.cluster.local:9092"
+          value: "$(KAFKA_HOST):$(KAFKA_PORT)"
+        # Schema Registry
+        - name: SCHEMA_REGISTRY_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: schema-registry_internal_host
+        - name: SCHEMA_REGISTRY_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: schema-registry_internal_port
         - name: KAFKA_CLUSTERS_0_SCHEMAREGISTRY
-          value: "http://schemaregistry.streamlink.svc.cluster.local:8081"
+          value: "http://$(SCHEMA_REGISTRY_HOST):$(SCHEMA_REGISTRY_PORT)"
         - name: KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME
           value: "streamlink-connect"
+        - name: KAFKA_CONNECT_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka-connect_internal_host
+        - name: KAFKA_CONNECT_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka-connect_internal_port
         - name: KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS
-          value: "http://kafka-connect.streamlink.svc.cluster.local:8083"
+          value: "http://$(KAFKA_CONNECT_HOST):$(KAFKA_CONNECT_PORT)"
+        # ksqlDB
+        - name: KSQLDB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: ksqldb_internal_host
+        - name: KSQLDB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: ksqldb_internal_port
         - name: KAFKA_CLUSTERS_0_KSQLDBSERVER
-          value: "http://ksqldb-server.streamlink.svc.cluster.local:8088"
+          value: "http://$(KSQLDB_HOST):$(KSQLDB_PORT)"
         # OAuth2 Authentication with Keycloak
         - name: AUTH_TYPE
           value: "OAUTH2"
@@ -50,16 +93,19 @@ spec:
               optional: true
         - name: AUTH_OAUTH2_CLIENT_KEYCLOAK_SCOPE
           value: "openid"
-        - name: AUTH_OAUTH2_CLIENT_KEYCLOAK_REDIRECT-URI
+        # Build issuer dynamically from external endpoints so browser can reach Keycloak
+        - name: KEYCLOAK_EXTERNAL_HOST
           valueFrom:
             configMapKeyRef:
-              name: streamlink-config
-              key: keycloak-kafbat-ui-redirect-uri
+              name: streamlink-deps
+              key: keycloak_external_host
+        - name: KEYCLOAK_EXTERNAL_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: keycloak_external_port
         - name: AUTH_OAUTH2_CLIENT_KEYCLOAK_ISSUER-URI
-          valueFrom:
-            configMapKeyRef:
-              name: streamlink-config
-              key: keycloak-issuer-uri
+          value: "http://$(KEYCLOAK_EXTERNAL_HOST):$(KEYCLOAK_EXTERNAL_PORT)/realms/streamlink"
         - name: AUTH_OAUTH2_CLIENT_KEYCLOAK_USER-NAME-ATTRIBUTE
           value: "preferred_username"
         - name: AUTH_OAUTH2_CLIENT_KEYCLOAK_CLIENT-NAME

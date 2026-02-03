@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../apiClient";
 
 export default function AddCluster() {
   const [formData, setFormData] = useState({
@@ -18,12 +18,10 @@ export default function AddCluster() {
     setLoading(true);
 
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
+      const response = await apiFetch(`/v1/clusters`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(formData),
       });

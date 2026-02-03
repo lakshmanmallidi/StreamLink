@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import iconImage from "../../icon.png";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../apiClient";
 
 export default function Dashboard({ children }) {
   const [user, setUser] = useState(null);
@@ -24,11 +24,7 @@ export default function Dashboard({ children }) {
 
   const checkClusterStatus = async (clusterId) => {
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`${API_BASE_URL}/v1/clusters/${clusterId}/check-status`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await apiFetch(`/v1/clusters/${clusterId}/check-status`, { method: "POST" });
     } catch (err) {
       console.error("Error checking cluster status:", err);
     }
@@ -36,10 +32,7 @@ export default function Dashboard({ children }) {
 
   const fetchClusters = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/clusters`);
       const data = await response.json();
       setClusters(data);
     } catch (err) {
@@ -49,10 +42,7 @@ export default function Dashboard({ children }) {
 
   const fetchServices = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/services`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/services`);
       const data = await response.json();
       setServices(data);
     } catch (err) {

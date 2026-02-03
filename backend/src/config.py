@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # External NodePort Configuration (for services exposed outside Kubernetes)
     POSTGRES_NODEPORT: int = 30432
     KEYCLOAK_NODEPORT: int = 30081
+    KAFBAT_UI_NODEPORT: int = 30080
 
     # CORS Configuration (exact origins with protocol)
     CORS_ORIGINS: List[str] = [
@@ -41,7 +42,13 @@ class Settings(BaseSettings):
     
     # Keycloak OAuth Client Configuration (for Kafbat UI)
     KEYCLOAK_KAFBAT_UI_CLIENT_ID: str = "kafbat-ui"
-    KEYCLOAK_KAFBAT_UI_REDIRECT_URI: str = "http://localhost:30080/login"
+
+    # Keycloak Issuer URI (for OIDC discovery used by Kafbat UI)
+    # Use internal service URL so in-cluster apps can reach it
+    KEYCLOAK_ISSUER_URI: str = "http://keycloak.streamlink.svc.cluster.local:8080/realms/streamlink"
+
+    # External URLs for Kafbat UI will be computed from cluster node IPs
+    # during deployment, not from static app settings.
 
     class Config:
         env_file = ".env"

@@ -72,9 +72,7 @@ class KeycloakAdmin:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to load Keycloak config from services table: {e}")
         
-        # Fallback to localhost if not configured
-        if not self.base_url:
-            self.base_url = f"http://localhost:{settings.KEYCLOAK_NODEPORT}"
+        # No hardcoded fallback; require base_url from DB or caller
     
     async def _get_admin_token(self) -> str:
         """Get admin access token, always fetch fresh to avoid expiration."""
@@ -162,6 +160,52 @@ class KeycloakAdmin:
             
             clients = response.json()
             return len(clients) > 0
+
+    async def update_client_redirects(
+        self,
+        client_id: str,
+        redirect_uris: list[str],
+        post_logout_uris: list[str] = None,
+    ) -> bool:
+        """Update an existing client's redirect URIs and logout URIs.
+
+        Returns True on success, False if client not found."""
+        token = await self._get_admin_token()
+        uuid = await self.get_client_uuid(client_id)
+        if not uuid:
+            return False
+
+        # Prepare client update payload; keep minimal, focusing on redirect URIs and attributes
+        from urllib.parse import urlparse
+        if post_logout_uris is None:
+            post_logout_uris = []
+            for uri in redirect_uris:
+                parsed = urlparse(uri)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+                if base_url not in post_logout_uris:
+                    post_logout_uris.append(base_url)
+
+        client_data = {
+            "id": uuid,
+            "clientId": client_id,
+            "redirectUris": redirect_uris,
+            "attributes": {
+                "post.logout.redirect.uris": "##".join(post_logout_uris)
+            }
+        }
+
+        url = f"{self.base_url}/admin/realms/{self.realm}/clients/{uuid}"
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                json=client_data
+            )
+
+        return response.status_code in [204, 200]
     
     async def get_client_uuid(self, client_id: str) -> Optional[str]:
         """Get the UUID of a client by client_id."""
@@ -371,9 +415,7 @@ class KeycloakAdmin:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to load Keycloak config: {e}")
         
-        # Fallback to localhost if not configured
-        if not self.base_url:
-            self.base_url = f"http://localhost:{settings.KEYCLOAK_NODEPORT}"
+        # No hardcoded fallback; require base_url from DB or caller
 
 
 # Singleton instance

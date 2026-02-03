@@ -34,6 +34,42 @@ A unified open-source tool for end-to-end event orchestration and Kubernetes ser
 
 ---
 
+## Architecture Overview
+
+```mermaid
+flowchart LR
+      U[User Browser] --> FE[StreamLink Frontend]
+      FE --> BE[StreamLink Backend (FastAPI)]
+      BE --> DB[(PostgreSQL)]
+      BE --> K8s[Kubernetes API]
+
+      subgraph Kubernetes Cluster
+         KC[Keycloak]
+         KF[Kafka]
+         SR[Schema Registry]
+         CON[Kafka Connect]
+         KSQL[ksqlDB]
+         KUI[Kafbat UI]
+      end
+
+      K8s --> KC
+      K8s --> KF
+      KF --> SR
+      KF --> CON
+      KF --> KSQL
+
+      KUI --> KC
+      KUI --> SR
+      KUI --> CON
+      KUI --> KSQL
+```
+
+### Automatic Service Wiring
+- **Dependency-aware deployments**: Each service discovers existing endpoints via ConfigMaps and environment expansion.
+- **Keycloak issuer**: Kafbat UI reads Keycloak external host/port and computes its issuer URL automatically.
+- **Kafka integrations**: Schema Registry, Kafka Connect, and ksqlDB auto-bind to Kafka using published cluster endpoints.
+- **Zero manual glue**: As you add deployments, they connect to what’s already running—no extra configuration needed.
+
 # Development Guide
 
 ## Prerequisites
@@ -54,40 +90,15 @@ cd StreamLink
 
 ### 2. Setup Environment Variables
 
-Copy the template and configure your secrets:
+Create `.env` with only one variable: `ENCRYPTION_KEY`.
 
 ```bash
-cp .env.example .env
-```
-
-Edit `.env` and set the following required secrets:
-
-```bash
-# PostgreSQL - will be deployed to Kubernetes
-DB_HOST=postgres.streamlink.svc.cluster.local
-DB_PORT=5432
-DB_NAME=streamlink
-DB_USER=streamlink
-DB_PASSWORD=<will-be-generated-on-deployment>
-
-# Keycloak - will be deployed to Kubernetes
-KEYCLOAK_URL=http://keycloak.streamlink.svc.cluster.local:8080
-KEYCLOAK_REALM=streamlink
-KEYCLOAK_CLIENT_ID=streamlink-api
-KEYCLOAK_CLIENT_SECRET=<will-be-generated-on-deployment>
-KEYCLOAK_ADMIN_PASSWORD=<will-be-generated-on-deployment>
-
-# Generate Encryption Key
-# Run: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-ENCRYPTION_KEY=<generated-key-here>
-```
-
-**Generate Encryption Key**:
-```bash
+# Generate a key, then paste it into .env
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+echo "ENCRYPTION_KEY=<paste-generated-key-here>" > .env
 ```
 
-Copy the output and paste it as `ENCRYPTION_KEY` in `.env`.
+All other service configuration is handled internally by StreamLink and stored in `backend/src/config.py`. You do not need to edit it.
 
 ### 3. Deploy Services to Kubernetes
 
@@ -102,21 +113,35 @@ StreamLink deploys all services (PostgreSQL, Keycloak, Kafka, etc.) to your Kube
 
 The system auto-generates passwords and handles dependencies automatically.
 
-#### 4.2 Create StreamLink Realm
+### 4. Post-Deployment: Create a Keycloak User (Manual)
 
-> **Why?** The `master` realm is for Keycloak administration only. Your application needs its own realm.
+> StreamLink initializes the `streamlink` realm and required clients automatically. You only need to create a login user.
 
-1. Click the **"Master"** dropdown in the top-left corner
-2. Click **"Create realm"**
-3. **Realm name**: `streamlink`
-4. Click **"Create"**
+1) Retrieve the Keycloak admin password from Kubernetes:
 
-You should now see "streamlink" in the top-left (not "Master").
+```bash
+kubectl -n streamlink get secret keycloak-secrets \
+   -o jsonpath='{.data.admin-password}' | base64 --decode; echo
+```
 
-#### 4.3 Create OAuth2 Client
+Admin username: `admin`
 
-1. In the left sidebar, click **"Clients"**
-2. Click **"Create client"** button
+2) Access the Keycloak Admin Console:
+- Option A (NodePort): `http://<node-ip>:30081/admin`
+   - Find node IP: `kubectl get nodes -o wide`
+- Option B (local port-forward):
+
+```bash
+kubectl -n streamlink port-forward svc/keycloak 8080:8080
+# Then open http://localhost:8080/admin
+```
+
+3) Create a user in the `streamlink` realm:
+- Top-left realm selector → choose `streamlink`
+- Users → Add user → set `username`
+- Credentials → Set password → disable `Temporary` → Save
+
+You can now log in to StreamLink with this user.
 ### 4. Run Backend
 
 ```bash
@@ -159,12 +184,10 @@ This script will:
 1. Open http://localhost:3001 in your browser
 2. Click **"Login"** button
 3. You'll be redirected to Keycloak
-4. Login with:
-   - Username: `testuser`
-   - Password: `password123`
+4. Log in with the user you created in the `streamlink` realm
 5. After successful login, you'll be redirected to the dashboard
 6. You should see:
-   - User info in the sidebar (testuser)
+   - User info in the sidebar
    - Dashboard home page
    - Kubernetes menu (if you add a cluster)
    - Services menu (after cluster is connected)
@@ -179,38 +202,20 @@ StreamLink separates **secrets** from **configuration** for security:
 
 | File | Purpose | In Git? |
 |------|---------|---------|
-| `.env` | **Secrets and config** | ❌ No (gitignored) |
-| `.env.example` | Template with placeholders | ✅ Yes |
-| `backend/src/config.py` | Backend configuration | ✅ Yes |
+| `.env` | Encryption key only (`ENCRYPTION_KEY`) | ❌ No (gitignored) |
+| `backend/src/config.py` | Internal application/service configuration | ✅ Yes |
 | `backend/deployments/*.yaml` | Kubernetes manifests | ✅ Yes |
 
 ### What Goes Where?
 
-**`.env` - Configuration** (all environment variables):
+**`.env`**:
 ```bash
-# Database (deployed to Kubernetes)
-DB_HOST=postgres.streamlink.svc.cluster.local
-DB_PORT=5432
-DB_NAME=streamlink
-DB_USER=streamlink
-DB_PASSWORD=<generated-on-deployment>
-
-# Keycloak (deployed to Kubernetes)
-KEYCLOAK_URL=http://keycloak.streamlink.svc.cluster.local:8080
-KEYCLOAK_REALM=streamlink
-KEYCLOAK_CLIENT_ID=streamlink-api
-KEYCLOAK_CLIENT_SECRET=<generated-on-deployment>
-KEYCLOAK_ADMIN_PASSWORD=<generated-on-deployment>
-
-# Encryption
 ENCRYPTION_KEY=<generated-key>
 ```
 
-**`backend/src/config.py` - Application Settings**:
-- Reads from environment variables
-- Provides defaults for development
-- JWT algorithm, token expiry times
-- CORS origins, debug mode
+**`backend/src/config.py`**:
+- Contains all other configuration (service defaults, OAuth, issuer URIs, etc.)
+- Managed by StreamLink; no manual edits required
 
 ---
 
@@ -529,10 +534,9 @@ For issues or questions:
 ## What's Next?
 
 Current development priorities:
-- [x] PostgreSQL deployment to Kubernetes
-- [x] Keycloak deployment with auto-realm initialization
-- [x] Service dependency management
-- [ ] Enhanced monitoring and alerting
-- [ ] Multi-cluster support
-- [ ] Cluster edit functionality
+- [ ] UI bug fixes and polish
+- [ ] End-to-end integration testing across services
+- [ ] Multi-cluster services for scale
+- [ ] Monitoring of all pods per deployment
+- [ ] Configurable resources (CPU/memory) during service deploy
 - [ ] Role-based access control (RBAC)

@@ -29,10 +29,24 @@ export default function AuthCallback() {
         });
 
         if (!response.ok) {
+          const ctErr = response.headers.get("content-type") || "";
+          if (!ctErr.includes("application/json")) {
+            const text = await response.text();
+            throw new Error(
+              `Callback failed with non-JSON response from ${API_BASE_URL}.\nPreview: ${text.slice(0, 120)}`
+            );
+          }
           const err = await response.json();
           throw new Error(err.detail || "Authentication failed");
         }
 
+        const ct = response.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) {
+          const text = await response.text();
+          throw new Error(
+            `Unexpected non-JSON callback response from ${API_BASE_URL}. Is VITE_API_URL pointing to backend?\nPreview: ${text.slice(0, 120)}`
+          );
+        }
         const data = await response.json();
         localStorage.setItem("access_token", data.access_token);
         localStorage.setItem("user", JSON.stringify(data.user));

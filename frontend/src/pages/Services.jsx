@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../config";
+import { apiFetch } from "../apiClient";
 
 export default function Services() {
   const [services, setServices] = useState([]);
@@ -60,11 +60,7 @@ export default function Services() {
 
   const checkServiceStatus = async (serviceId) => {
     try {
-      const token = localStorage.getItem("access_token");
-      await fetch(`${API_BASE_URL}/v1/services/${serviceId}/check-status`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await apiFetch(`/v1/services/${serviceId}/check-status`, { method: "POST" });
       // Refresh the list after checking
       await fetchServices();
     } catch (err) {
@@ -74,10 +70,7 @@ export default function Services() {
 
   const fetchCluster = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/clusters`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/clusters`);
       const data = await response.json();
       setCluster(data.length > 0 ? data[0] : null);
     } catch (err) {
@@ -87,10 +80,7 @@ export default function Services() {
 
   const fetchServices = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/services`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/services`);
       const data = await response.json();
       setServices(data);
     } catch (err) {
@@ -102,10 +92,7 @@ export default function Services() {
 
   const fetchBootstrapStatus = async () => {
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/bootstrap/status`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/bootstrap/status`);
       const data = await response.json();
       setBootstrapStatus(data);
       
@@ -124,11 +111,7 @@ export default function Services() {
 
     setMigrating(true);
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/bootstrap/migrate`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await apiFetch(`/v1/bootstrap/migrate`, { method: "POST" });
 
       if (!response.ok) {
         const error = await response.json();
@@ -154,13 +137,9 @@ export default function Services() {
 
     // First, get the deployment plan
     try {
-      const token = localStorage.getItem("access_token");
-      const planResponse = await fetch(`${API_BASE_URL}/v1/services/deployment-plan`, {
+      const planResponse = await apiFetch(`/v1/services/deployment-plan`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cluster_id: cluster.id,
           name: serviceName,
@@ -200,13 +179,9 @@ export default function Services() {
     setShowPlanModal(false);
     
     try {
-      const token = localStorage.getItem("access_token");
-      const response = await fetch(`${API_BASE_URL}/v1/services`, {
+      const response = await apiFetch(`/v1/services`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cluster_id: cluster.id,
           name: serviceName,
@@ -232,12 +207,8 @@ export default function Services() {
 
   const deleteService = async (service) => {
     try {
-      const token = localStorage.getItem("access_token");
-      
       // First, get the delete plan to see what will be deleted
-      const planResponse = await fetch(`${API_BASE_URL}/v1/services/${service.id}/delete-plan`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const planResponse = await apiFetch(`/v1/services/${service.id}/delete-plan`);
       
       if (!planResponse.ok) {
         throw new Error("Failed to get delete plan");
@@ -258,13 +229,10 @@ export default function Services() {
     if (!deletePlan) return;
 
     try {
-      const token = localStorage.getItem("access_token");
-      
       // Delete with cascade if there are dependents
       const cascade = deletePlan.dependents.length > 0;
-      const response = await fetch(`${API_BASE_URL}/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
+      const response = await apiFetch(`/v1/services/${deletePlan.target.id}?cascade=${cascade}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
       });
       
       const result = await response.json();

@@ -34,7 +34,17 @@ spec:
         image: confluentinc/cp-kafka-connect:7.5.0
         env:
         - name: CONNECT_BOOTSTRAP_SERVERS
-          value: "kafka.streamlink.svc.cluster.local:9092"
+          value: "$(KAFKA_HOST):$(KAFKA_PORT)"
+        - name: KAFKA_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_host
+        - name: KAFKA_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_port
         - name: CONNECT_REST_PORT
           value: "8083"
         - name: CONNECT_REST_ADVERTISED_HOST_NAME
@@ -57,8 +67,18 @@ spec:
           value: "org.apache.kafka.connect.storage.StringConverter"
         - name: CONNECT_VALUE_CONVERTER
           value: "io.confluent.connect.avro.AvroConverter"
+        - name: SCHEMA_REGISTRY_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: schema-registry_internal_host
+        - name: SCHEMA_REGISTRY_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: schema-registry_internal_port
         - name: CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL
-          value: "http://schemaregistry.streamlink.svc.cluster.local:8081"
+          value: "http://$(SCHEMA_REGISTRY_HOST):$(SCHEMA_REGISTRY_PORT)"
         - name: CONNECT_INTERNAL_KEY_CONVERTER
           value: "org.apache.kafka.connect.json.JsonConverter"
         - name: CONNECT_INTERNAL_VALUE_CONVERTER
@@ -71,12 +91,12 @@ spec:
           value: "org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR"
         # Consumer settings
         - name: CONNECT_CONSUMER_BOOTSTRAP_SERVERS
-          value: "kafka.streamlink.svc.cluster.local:9092"
+          value: "$(KAFKA_HOST):$(KAFKA_PORT)"
         - name: CONNECT_CONSUMER_INTERCEPTOR_CLASSES
           value: "io.confluent.monitoring.clients.interceptor.MonitoringConsumerInterceptor"
         # Producer settings
         - name: CONNECT_PRODUCER_BOOTSTRAP_SERVERS
-          value: "kafka.streamlink.svc.cluster.local:9092"
+          value: "$(KAFKA_HOST):$(KAFKA_PORT)"
         - name: CONNECT_PRODUCER_INTERCEPTOR_CLASSES
           value: "io.confluent.monitoring.clients.interceptor.MonitoringProducerInterceptor"
         ports:

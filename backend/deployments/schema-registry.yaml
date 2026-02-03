@@ -35,8 +35,18 @@ spec:
           value: ""
         - name: SCHEMA_REGISTRY_HOST_NAME
           value: "schemaregistry"
+        - name: KAFKA_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_host
+        - name: KAFKA_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: streamlink-deps
+              key: kafka_internal_port
         - name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS
-          value: "kafka.streamlink.svc.cluster.local:9092"
+          value: "$(KAFKA_HOST):$(KAFKA_PORT)"
         - name: SCHEMA_REGISTRY_LISTENERS
           value: "http://0.0.0.0:8081"
         - name: SCHEMA_REGISTRY_KAFKASTORE_TOPIC
